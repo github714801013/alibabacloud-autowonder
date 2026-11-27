@@ -25,6 +25,14 @@ public interface DispatchRuntimeEventDao {
     List<DispatchRuntimeEventDO> listByDispatchInArrivalOrder(@Param("tenantId") Long tenantId,
                                                                @Param("dispatchId") Long dispatchId);
 
+    /** 轨迹投影：不返回 agent.message，其内容通过轮次详情查看。 */
+    List<DispatchRuntimeEventDO> listByDispatchForTrace(@Param("tenantId") Long tenantId,
+                                                        @Param("dispatchId") Long dispatchId);
+
+    /** 轮询快速路径：轨迹投影的最新到达 id。 */
+    Long findLatestIdForTrace(@Param("tenantId") Long tenantId,
+                              @Param("dispatchId") Long dispatchId);
+
     /** Rows arrived after a client cursor, so a backfill read does not reproject the whole history. */
     List<DispatchRuntimeEventDO> listByDispatchAfterId(@Param("tenantId") Long tenantId,
                                                        @Param("dispatchId") Long dispatchId,

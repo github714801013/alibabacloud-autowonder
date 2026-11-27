@@ -5,6 +5,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 
@@ -338,6 +339,39 @@ class ConversationElicitationServiceTest {
         verifyNoFrameSent();
     }
 
+    @Test
+    void assignedOwnerMayAnswerThroughPolicy() {
+        var record = new AgentConversationElicitationDO();
+        record.setTurnId(100L); record.setStatus("PENDING"); record.setRequestId("owner-card");
+        when(dao.findByRequestId(1L, 10L, "owner-card")).thenReturn(record);
+        when(dao.settleIfPending(1L, 10L, "owner-card", "ANSWERED", "{}")).thenReturn(1);
+        var active = turn("IN", "PROCESSING"); active.setSubmittedUserId(70L);
+        when(turnDao.findByConversationTurn(1L, 10L, 100L)).thenReturn(active);
+        var policy = mock(ClarificationAnswerActorPolicy.class);
+        when(policy.mayAnswer(1L, 10L, 71L)).thenReturn(true);
+        service.setAnswerActorPolicy(policy);
+
+        service.reply(1L, 10L, "owner-card", "accept", "{}", 71L);
+
+        verify(dao).settleIfPending(1L, 10L, "owner-card", "ANSWERED", "{}");
+        verify(transport).sendElicitationReply(any(), eq(100L), eq("owner-card"), eq("accept"), eq("{}"));
+    }
+
+    @Test
+    void policyDenialKeepsOriginalActorRequirement() {
+        var record = new AgentConversationElicitationDO();
+        record.setTurnId(100L); record.setStatus("PENDING"); record.setRequestId("denied-card");
+        when(dao.findByRequestId(1L, 10L, "denied-card")).thenReturn(record);
+        var active = turn("IN", "PROCESSING"); active.setSubmittedUserId(70L);
+        when(turnDao.findByConversationTurn(1L, 10L, 100L)).thenReturn(active);
+        var policy = mock(ClarificationAnswerActorPolicy.class);
+        when(policy.mayAnswer(1L, 10L, 71L)).thenReturn(false);
+        service.setAnswerActorPolicy(policy);
+
+        assertThrows(BizException.class, () -> service.reply(1L, 10L, "denied-card", "accept", "{}", 71L));
+        verify(dao, never()).settleIfPending(anyLong(), anyLong(), anyString(), anyString(), any());
+    }
+
     private static final String MULTI_SCHEMA = "{\"type\":\"object\",\"properties\":{"
             + "\"q0\":{\"type\":\"string\"},\"q1\":{\"type\":\"array\",\"items\":{\"anyOf\":[{\"const\":\"x\"}]}},"
             + "\"q2\":{\"type\":\"string\"}},\"required\":[\"q0\",\"q1\"]}";
@@ -462,6 +496,65 @@ class ConversationElicitationServiceTest {
         assertEquals(10L, saved.getConversationId());
         assertEquals(100L, saved.getTurnId());
         assertTrue(saved.getSchemaJson().contains("\"type\":\"object\""));
+    }
+
+    /** 工单澄清对话新出现的待回答卡片要通知监听器，由后者推送企业微信。 */
+    @Test
+    void publishesWorkitemClarificationQuestionWhenNewlyPending() {
+        AgentConversationDO conv = conversation();
+        conv.setChannel(WorkitemClarificationConversationService.CHANNEL);
+        conv.setBizRefType(WorkitemClarificationConversationService.BIZ_REF_TYPE);
+        conv.setBizRefId(77L);
+        conv.setAgentId(10035L);
+        when(convDao.findById(1L, 10L)).thenReturn(conv);
+        when(dao.insertIfAbsent(any())).thenReturn(1);
+        AgentConversationTurnDO asking = turn("IN", "PROCESSING");
+        asking.setSubmittedUserId(70L);
+        when(turnDao.findByConversationTurn(1L, 10L, 100L)).thenReturn(asking);
+        List<Object> events = new ArrayList<>();
+        service.setApplicationEventPublisher(events::add);
+
+        service.onEvent(1L, 10L, 100L, "acp_elicitation", openedPayload("req-1"));
+
+        assertEquals(1, events.size());
+        var event = (ConversationElicitationService.WorkitemClarificationQuestionOpened) events.get(0);
+        assertEquals(1L, event.tenantId());
+        assertEquals(77L, event.workitemId());
+        assertEquals(10L, event.conversationId());
+        assertEquals(10035L, event.agentId());
+        assertEquals(100L, event.turnId());
+        assertEquals(70L, event.submittedUserId());
+        assertEquals("req-1", event.requestId());
+        assertEquals("pick", event.message());
+    }
+
+    /** 同一条提问的重复上行不能重复推送。 */
+    @Test
+    void doesNotPublishQuestionWhenInsertIsDuplicate() {
+        AgentConversationDO conv = conversation();
+        conv.setChannel(WorkitemClarificationConversationService.CHANNEL);
+        conv.setBizRefType(WorkitemClarificationConversationService.BIZ_REF_TYPE);
+        conv.setBizRefId(77L);
+        when(convDao.findById(1L, 10L)).thenReturn(conv);
+        when(dao.insertIfAbsent(any())).thenReturn(0);
+        List<Object> events = new ArrayList<>();
+        service.setApplicationEventPublisher(events::add);
+
+        service.onEvent(1L, 10L, 100L, "acp_elicitation", openedPayload("req-1"));
+
+        assertTrue(events.isEmpty());
+    }
+
+    /** 非工单澄清会话（如 Chief of Staff）不触发工单待回答推送。 */
+    @Test
+    void doesNotPublishQuestionOutsideWorkitemClarification() {
+        when(dao.insertIfAbsent(any())).thenReturn(1);
+        List<Object> events = new ArrayList<>();
+        service.setApplicationEventPublisher(events::add);
+
+        service.onEvent(1L, 10L, 100L, "acp_elicitation", openedPayload("req-1"));
+
+        assertTrue(events.isEmpty());
     }
 
     /**
@@ -821,6 +914,35 @@ class ConversationElicitationServiceTest {
         verifyNoFrameSent();
     }
 
+    /** 工具卡片没有执行器侧挂起请求：取消只唤醒平台等待者，不发执行器帧。 */
+    @Test
+    void cancelTurnWakesToolCardWithoutExecutorFrame() {
+        ConversationQuestionToolService questionTool = mock(ConversationQuestionToolService.class);
+        service.setQuestionTool(questionTool);
+        when(dao.listPendingByTurn(1L, 100L)).thenReturn(List.of(pending("mcpq-1", 100L)));
+        when(dao.settleIfPending(anyLong(), anyLong(), anyString(), anyString(), any())).thenReturn(1);
+
+        cancelTurn(service);
+
+        verify(questionTool).wake(10L, "mcpq-1", "CANCELED", null);
+        verifyNoFrameSent();
+    }
+
+    /** 装配了工具服务也不能影响执行器上行卡片的原有取消链路。 */
+    @Test
+    void cancelTurnStillFramesExecutorCardWhenToolServicePresent() {
+        ConversationQuestionToolService questionTool = mock(ConversationQuestionToolService.class);
+        service.setQuestionTool(questionTool);
+        when(dao.listPendingByTurn(1L, 100L)).thenReturn(List.of(pending("req-1", 100L)));
+        when(dao.settleIfPending(anyLong(), anyLong(), anyString(), anyString(), any())).thenReturn(1);
+
+        cancelTurn(service);
+
+        verify(questionTool, never()).wake(anyLong(), anyString(), anyString(), any());
+        verify(transport).sendElicitationReply(any(AgentConversationDO.class), eq(100L),
+                eq("req-1"), eq("cancel"), isNull());
+    }
+
     /** 取消路径不能因为一张卡片投递失败就放弃剩下的：轮次取消随后就会执行。 */
     @Test
     void cancelTurnContinuesAfterOneDeliveryFailure() {
@@ -878,6 +1000,60 @@ class ConversationElicitationServiceTest {
 
         assertEquals(1, settled.size());
         assertEquals("req-2", settled.get(0).getRequestId());
+    }
+
+    /** 轮次终结但卡片要保留：置 EXPIRED，返回值供提交后唤醒等待者与推送浏览器。 */
+    @Test
+    void expirePendingForTurnWritesExpiredStateWithoutSideEffects() {
+        when(dao.listPendingByTurn(1L, 100L)).thenReturn(List.of(pending("req-1", 100L)));
+        when(dao.settleIfPending(anyLong(), anyLong(), anyString(), anyString(), any())).thenReturn(1);
+
+        List<AgentConversationElicitationDO> settled = service.expirePendingForTurn(1L, 10L, 100L);
+
+        assertEquals(1, settled.size());
+        assertEquals("EXPIRED", settled.get(0).getStatus());
+        verify(dao).settleIfPending(1L, 10L, "req-1", "EXPIRED", null);
+        verifyNoFrameSent();
+        verify(browserEventPublisher, never()).publishServerEvent(anyLong(), anyLong(), anyLong(),
+                anyString(), anyString());
+    }
+
+    /** 过期任务主卡到期时，同轮其余挂起卡也必须保留为 EXPIRED，而不是被当作取消撤下。 */
+    @Test
+    void expireForAttemptKeepsSiblingPendingCardsExpired() {
+        AgentConversationElicitationDO main = pending("mcpq-main", 100L);
+        main.setGmtCreate(new Date(0L));
+        main.setDispatchAttempt(1);
+        main.setExecutorId(9L);
+        AgentConversationElicitationDO sibling = pending("mcpq-sibling", 100L);
+        when(dao.findByRequestIdForUpdate(1L, 10L, "mcpq-main")).thenReturn(main);
+        when(dao.listPendingByTurn(1L, 100L)).thenReturn(List.of(sibling));
+        when(dao.settleIfPending(1L, 10L, "mcpq-main", "EXPIRED", null)).thenReturn(1);
+        when(dao.settleIfPending(1L, 10L, "mcpq-sibling", "EXPIRED", null)).thenReturn(1);
+        AgentConversationTurnDO turn = turn("IN", "PROCESSING");
+        turn.setDispatchAttempt(1);
+
+        List<AgentConversationElicitationDO> settled = service.expireForAttempt(main, new Date(),
+                turn, conversation());
+
+        assertEquals(List.of("mcpq-main", "mcpq-sibling"),
+                settled.stream().map(AgentConversationElicitationDO::getRequestId).toList());
+        assertEquals(List.of("EXPIRED", "EXPIRED"),
+                settled.stream().map(AgentConversationElicitationDO::getStatus).toList());
+    }
+
+    /** 工具卡片在轮次终结后按 EXPIRED 唤醒等待者，前端才能把卡片按超时卡片保留。 */
+    @Test
+    void notifySystemStoppedWakesToolCardWithExpired() {
+        ConversationQuestionToolService questionTool = mock(ConversationQuestionToolService.class);
+        service.setQuestionTool(questionTool);
+        AgentConversationElicitationDO expired = pending("mcpq-1", 100L);
+        expired.setStatus("EXPIRED");
+
+        service.notifySystemStopped(List.of(expired));
+
+        verify(questionTool).wake(10L, "mcpq-1", "EXPIRED", null);
+        verifyNoFrameSent();
     }
 
     @Test

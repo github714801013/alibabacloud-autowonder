@@ -12,6 +12,7 @@ import {
   assembleTurnEvents,
   hasPersistedReplyForTurn,
   findPairedInboundTurnId,
+  hiddenFailedOutboundTurnIds,
   useClarificationConversation,
   useLatestClarificationConversation,
   isClarificationReplyingStatus,
@@ -20,6 +21,7 @@ import {
   isClarificationNonRetryableError,
   CLARIFICATION_PROCESSING_POLL_MS,
   CLARIFICATION_QUERY_MAX_RETRY,
+  MAX_STREAMED_EVENTS,
   type StreamedEvent,
 } from './hooks';
 import { ApiError, ErrorCodes } from '@/shared/types/common';
@@ -404,6 +406,47 @@ describe('useClarificationEvents', () => {
 
     await waitFor(() => expect(result.current.streamedEvents).toHaveLength(1));
     expect(result.current.streamedEvents[0].payload?.content).toBe('duplicate');
+  });
+
+  it('caps accumulated streamed events to the latest window', () => {
+    // 正文归摘要管线，streamedEvents 只留 status/error/acp 控制事件；控制事件的
+    // 同轮窗口是 hooks 里写死的 slice(-255)+1，MAX_STREAMED_EVENTS 只是数组兜底。
+    const CONTROL_WINDOW = 256;
+    const { result } = renderHook(() => useClarificationEvents('100', 1, 10), { wrapper });
+    act(() => {
+      for (let seq = 1; seq <= MAX_STREAMED_EVENTS + 1; seq += 1) {
+        emitTurnEvent(capturedCallback!, makeEvent(10, seq, 'status', `chunk-${seq}`));
+      }
+    });
+    expect(result.current.streamedEvents).toHaveLength(CONTROL_WINDOW);
+    expect(result.current.streamedEvents[0].eventSeq).toBe(MAX_STREAMED_EVENTS + 2 - CONTROL_WINDOW);
+    expect(result.current.streamedEvents[CONTROL_WINDOW - 1].eventSeq).toBe(MAX_STREAMED_EVENTS + 1);
+  });
+
+  it('keeps every event when the count equals the window', () => {
+    const CONTROL_WINDOW = 256;
+    const { result } = renderHook(() => useClarificationEvents('100', 1, 10), { wrapper });
+    act(() => {
+      for (let seq = 1; seq <= CONTROL_WINDOW; seq += 1) {
+        emitTurnEvent(capturedCallback!, makeEvent(10, seq, 'status', `chunk-${seq}`));
+      }
+    });
+    expect(result.current.streamedEvents).toHaveLength(CONTROL_WINDOW);
+    expect(result.current.streamedEvents[0].eventSeq).toBe(1);
+  });
+
+  it('resetStreamedEvents clears the overflowed window', () => {
+    const { result } = renderHook(() => useClarificationEvents('100', 1, 10), { wrapper });
+    act(() => {
+      for (let seq = 1; seq <= MAX_STREAMED_EVENTS + 1; seq += 1) {
+        emitTurnEvent(capturedCallback!, makeEvent(10, seq, 'text', `chunk-${seq}`));
+      }
+    });
+    act(() => {
+      result.current.resetStreamedEvents();
+    });
+    expect(result.current.streamedEvents).toHaveLength(0);
+    expect(result.current.streamedText).toBe('');
   });
 
   it('keeps different attempts with the same sequence in realtime', async () => {
@@ -812,6 +855,88 @@ describe('findPairedInboundTurnId', () => {
   it('still pairs when status is absent', () => {
     const turns = [turn(1, 'IN'), turn(2, 'OUT')];
     expect(findPairedInboundTurnId(turns, 1)).toBe(1);
+  });
+});
+
+describe('hiddenFailedOutboundTurnIds', () => {
+  // 重试只重置原 IN 轮次：IN 仍是 FAILED 时，本次投递的失败气泡要保留，
+  // 否则用户点重试后连「为什么失败」都一起消失了。
+  it('keeps the only failed outbound bubble while the inbound turn is still failed', () => {
+    const turns = [
+      { id: 1, direction: 'IN', status: 'FAILED' },
+      { id: 2, direction: 'OUT', status: 'FAILED' },
+    ];
+    expect(hiddenFailedOutboundTurnIds(turns).size).toBe(0);
+  });
+
+  // 重试已被接受并重新派发：旧失败气泡属于历史投递，必须整体隐藏。
+  // QUEUED 的 IN 默认按详情配对语义跳过；只有调用方明确传入正在重试的轮次时才隐藏。
+  it('hides every failed outbound bubble while the inbound turn is being redelivered', () => {
+    const turns = [
+      { id: 1, direction: 'IN', status: 'PROCESSING' },
+      { id: 2, direction: 'OUT', status: 'FAILED' },
+    ];
+    expect([...hiddenFailedOutboundTurnIds(turns)]).toEqual([2]);
+  });
+
+  // 手动重试被接受、执行器暂无空位时 IN 停在 QUEUED，这段窗口同样是重试中。
+  it('hides the stale failure while the retried inbound turn waits in the queue', () => {
+    const turns = [
+      { id: 1, direction: 'IN', status: 'QUEUED' },
+      { id: 2, direction: 'OUT', status: 'FAILED' },
+    ];
+    expect([...hiddenFailedOutboundTurnIds(turns, 1)]).toEqual([2]);
+  });
+
+  // 重试成功并产生新回复：旧的失败气泡不能再和新回复并排出现。
+  it('hides the failed bubble once the retried turn has a successful reply', () => {
+    const turns = [
+      { id: 1, direction: 'IN', status: 'SUCCESS' },
+      { id: 2, direction: 'OUT', status: 'FAILED' },
+      { id: 3, direction: 'OUT', status: 'SUCCESS' },
+    ];
+    expect([...hiddenFailedOutboundTurnIds(turns)]).toEqual([2]);
+  });
+
+  // 普通执行失败不是重试残留：IN 正常完成但没有成功回复时必须显示原因。
+  it('keeps a plain execution failure visible when the inbound turn has no reply', () => {
+    const turns = [
+      { id: 1, direction: 'IN', status: 'COMPLETED' },
+      { id: 2, direction: 'OUT', status: 'FAILED' },
+    ];
+    expect(hiddenFailedOutboundTurnIds(turns).size).toBe(0);
+  });
+
+  // 自动重投把同一 IN 的失败 OUT 堆了多条：只保留最后一条，避免重试后残留两行报错。
+  it('keeps only the last failed bubble when one inbound turn failed several times', () => {
+    const turns = [
+      { id: 1, direction: 'IN', status: 'FAILED' },
+      { id: 2, direction: 'OUT', status: 'FAILED' },
+      { id: 3, direction: 'OUT', status: 'FAILED' },
+    ];
+    expect([...hiddenFailedOutboundTurnIds(turns)]).toEqual([2]);
+  });
+
+  it('skips a queued inbound turn when pairing just like the detail panel does', () => {
+    const turns = [
+      { id: 1, direction: 'IN', status: 'FAILED' },
+      { id: 2, direction: 'OUT', status: 'FAILED' },
+      { id: 3, direction: 'IN', status: 'QUEUED' },
+    ];
+    expect(hiddenFailedOutboundTurnIds(turns).size).toBe(0);
+  });
+
+  it('never hides an orphaned failed bubble without a paired inbound turn', () => {
+    const turns = [{ id: 2, direction: 'OUT', status: 'FAILED' }];
+    expect(hiddenFailedOutboundTurnIds(turns).size).toBe(0);
+  });
+
+  it('ignores outbound bubbles that did not fail', () => {
+    const turns = [
+      { id: 1, direction: 'IN', status: 'SUCCESS' },
+      { id: 2, direction: 'OUT', status: 'SUCCESS' },
+    ];
+    expect(hiddenFailedOutboundTurnIds(turns).size).toBe(0);
   });
 });
 

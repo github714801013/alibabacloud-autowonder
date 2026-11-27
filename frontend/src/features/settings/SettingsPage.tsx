@@ -21,6 +21,7 @@ import {
   updateSettings,
 } from './api';
 import type { AiUsageVO, SettingItem, SettingVO, UpdateQuotaRequest } from './api';
+import { AiCollaborationDefaultsPage } from './AiCollaborationDefaultsPage';
 import { getPlatformImChannels, PLATFORM_IM_CHANNELS_QUERY_KEY, selectedImProvider } from '@/features/platform/brandingApi';
 import { Alert } from 'antd';
 import { useAccessCommand } from '@/shared/auth/useAccessCommand';
@@ -53,9 +54,14 @@ const SYSTEM_SETTINGS: SettingSchema[] = [
 
 const NOTIFY_TYPES = [
   { type: 'WORKITEM_ASSIGNED', labelKey: 'assigned' },
+  { type: 'COMMENT_MENTION', labelKey: 'commentMention' },
+  { type: 'WORKITEM_INPUT_REQUIRED', labelKey: 'inputRequired' },
+  { type: 'WORKITEM_CLARIFICATION_REPLY', labelKey: 'clarificationReply' },
+  { type: 'WORKITEM_APPROVAL_REQUIRED', labelKey: 'approvalRequired' },
   { type: 'DELIVERY_BLOCKED', labelKey: 'deliveryBlocked' },
   { type: 'AI_SESSION_DONE', labelKey: 'aiDone' },
   { type: 'REVIEW_REQUIRED', labelKey: 'reviewRequired' },
+  { type: 'CONVERSATION_DISPATCH_FAILED', labelKey: 'conversationDispatchFailed' },
 ] as const;
 
 function settingsToInitialValues(schema: SettingSchema[], settings: SettingVO[]) {
@@ -213,11 +219,14 @@ function NotifySettingsTab() {
 
   const channelQuery = useQuery({ queryKey: PLATFORM_IM_CHANNELS_QUERY_KEY, queryFn: getPlatformImChannels });
   const provider = selectedImProvider(channelQuery.data ?? []);
-  const providerKey = provider === 'FEISHU' ? 'feishu' : 'dingtalk';
-  const providerLabel = provider === 'FEISHU' ? t('feishu') : t('dingtalk');
+  const providerKey = provider === 'FEISHU' ? 'feishu' : provider === 'WECOM' ? 'wecom' : 'dingtalk';
+  const providerLabel = t(providerKey);
+  const enableLabelKey = providerKey === 'feishu'
+    ? 'enableFeishu' as const
+    : providerKey === 'wecom' ? 'enableWecom' as const : 'enableDingTalk' as const;
   const notifySettings = useMemo(() => NOTIFY_SETTINGS.map((item) => ({
-    ...item, key: `${providerKey}_enabled`, labelKey: providerKey === 'feishu' ? 'enableFeishu' as const : item.labelKey,
-  })), [providerKey]);
+    ...item, key: `${providerKey}_enabled`, labelKey: enableLabelKey,
+  })), [providerKey, enableLabelKey]);
   const prefsQuery = useQuery({ queryKey: ['notify-prefs'], queryFn: listNotifyPrefs });
   const settingsQuery = useSettingsGroup('NOTIFY', settingsForm, notifySettings);
 
@@ -228,7 +237,8 @@ function NotifySettingsTab() {
       const pref = byType.get(type);
       return [
         [`${type}.inApp`, pref?.inApp ?? true],
-        [`${type}.${providerKey}`, pref?.[providerKey] ?? false],
+        [`${type}.${providerKey}`, pref?.[providerKey]
+          ?? (pref == null && type === 'CONVERSATION_DISPATCH_FAILED' && providerKey === 'wecom')],
       ];
     }));
     prefForm.setFieldsValue(values);
@@ -237,16 +247,15 @@ function NotifySettingsTab() {
   const saveMut = useMutation({
     mutationFn: async () => {
       const prefValues = prefForm.getFieldsValue();
+      const savePrefs = updateNotifyPrefs(NOTIFY_TYPES.map(({ type }) => ({
+        type,
+        inApp: Boolean(prefValues[`${type}.inApp`]),
+        dingtalk: providerKey === 'dingtalk' && Boolean(prefValues[`${type}.dingtalk`]),
+        feishu: providerKey === 'feishu' && Boolean(prefValues[`${type}.feishu`]),
+        wecom: providerKey === 'wecom' && Boolean(prefValues[`${type}.wecom`]),
+      })));
       const settingValues = settingsForm.getFieldsValue();
-      await Promise.all([
-        updateNotifyPrefs(NOTIFY_TYPES.map(({ type }) => ({
-          type,
-          inApp: Boolean(prefValues[`${type}.inApp`]),
-          dingtalk: providerKey === 'dingtalk' && Boolean(prefValues[`${type}.dingtalk`]),
-          feishu: providerKey === 'feishu' && Boolean(prefValues[`${type}.feishu`]),
-        }))),
-        updateSettings('NOTIFY', buildSettingItems(notifySettings, settingValues)),
-      ]);
+      await Promise.all([savePrefs, updateSettings('NOTIFY', buildSettingItems(notifySettings, settingValues))]);
     },
     onSuccess: () => {
       message.success(i18n.t('settings:notifySaved'));
@@ -347,15 +356,15 @@ function SystemSettingsTab() {
 
 export function SettingsPage() {
   const { t } = useTranslation('settings');
+  const tabs = [
+    { key: 'AI', label: t('aiTab'), children: <AiSettingsTab /> },
+    { key: 'NOTIFY', label: t('notifyTab'), children: <NotifySettingsTab /> },
+    { key: 'SYSTEM', label: t('systemTab'), children: <SystemSettingsTab /> },
+    { key: 'AI_DEFAULTS', label: t('aiDefaultsTab'), children: <AiCollaborationDefaultsPage /> },
+  ];
   return (
     <Card className="aw-content-card" title={<PageHeading title={t('settings')} description={t('settingsDescription')} />}>
-      <Tabs
-        items={[
-          { key: 'AI', label: t('aiTab'), children: <AiSettingsTab /> },
-          { key: 'NOTIFY', label: t('notifyTab'), children: <NotifySettingsTab /> },
-          { key: 'SYSTEM', label: t('systemTab'), children: <SystemSettingsTab /> },
-        ]}
-      />
+      <Tabs items={tabs} />
     </Card>
   );
 }

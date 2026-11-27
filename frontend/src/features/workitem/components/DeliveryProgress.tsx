@@ -9,7 +9,7 @@ import { Card, Typography, Space, Spin, Collapse, Tag, Tooltip, Button, Popover,
 import { CheckCircleFilled, CloseCircleFilled, CompressOutlined, LoadingOutlined } from '@ant-design/icons';
 import { AwStrokeIcon } from '@/shared/ui/AwStrokeIcon';
 import type { AgentDeliveryProgress, Artifact, DeliveryProgress as DeliveryProgressModel, DeliveryStep, DispatchAttempt, ProcessGraph, ProcessGraphEdge, ProcessGraphNode, StepTiming, SubStep, WorkflowPlan } from '@/shared/types/workitem';
-import { artifactCategories, artifactsForReadingCategory, groupArtifactsByExecution } from '../artifactGrouping';
+import { artifactCategories, artifactsForReadingCategory, artifactsInDisplayOrder, groupArtifactsByExecution } from '../artifactGrouping';
 import { basename } from '@/shared/lib/artifactLinking';
 import { formatCredits } from '@/shared/lib/tokenFormat';
 import { getArtifactDownloadUrl, getRuntimeTrace } from '../api';
@@ -28,6 +28,7 @@ import { creditRunLabel, creditRuns } from './creditsBreakdown';
 import { NoticeTip } from '@/shared/ui/NoticeTip';
 import { DeliveryStartRecords, useRecoveryState } from './RecoveryControls';
 import type { RestartRound } from './RecoveryControls';
+import { useIsMobile } from '@/shared/ui/useIsMobile';
 
 const { Text } = Typography;
 
@@ -669,6 +670,18 @@ function AuthoritativeExecutionProcessGraph({ processGraph, entries, onOpenTrace
     <span>{runtimeEdgeLabel(selected.edge, selected.source.status)}</span>
     <span>{t('delivery.lineage', { sourceName: graphAgentName(selected.source), targetName: graphAgentName(selected.target), source: selected.edge.sourceDispatchId ?? '-', target: selected.edge.targetDispatchId ?? '-' })}</span>
   </Space>);
+  const beginDrag = (event: { button: number; clientX: number; clientY: number }) => {
+    if (event.button !== 0) return;
+    const start = point(event.clientX, event.clientY);
+    dragState.current = { startX: start.x, startY: start.y, panX: pan.x, panY: pan.y };
+  };
+  const moveDrag = (event: { clientX: number; clientY: number }) => {
+    const drag = dragState.current;
+    if (!drag) return;
+    const next = point(event.clientX, event.clientY);
+    setPan({ x: drag.panX + next.x - drag.startX, y: drag.panY + next.y - drag.startY });
+  };
+  const endDrag = () => { dragState.current = null; };
   return <div data-testid={fullscreen ? 'execution-graph-fullscreen' : undefined} className={fullscreen ? 'execution-graph-fullscreen' : undefined}>
     <section data-testid="delivery-graph-card" className="execution-graph-section">
       <div className="execution-graph-heading"><Text strong>{t('delivery.graph')}</Text><span className="execution-graph-sub">{t('delivery.graphTransitions', { count: edges.length })}</span></div>
@@ -680,11 +693,12 @@ function AuthoritativeExecutionProcessGraph({ processGraph, entries, onOpenTrace
           <Tooltip title={fullscreen ? t('delivery.exitFullscreen') : t('delivery.fullscreen')}><Button size="small" aria-label={fullscreen ? t('delivery.exitFullscreen') : t('delivery.fullscreen')} icon={fullscreen ? <CompressOutlined aria-hidden="true" /> : <AwStrokeIcon name="fullscreen" />} onClick={() => setFullscreen(value => !value)} /></Tooltip>
           <Tooltip title={t('delivery.fitWidth')}><Button size="small" className="execution-graph-fit" aria-label={t('delivery.fitWidth')} onClick={() => fit(true)}>{t('delivery.fitWidth')}</Button></Tooltip>
         </div>
-        <div ref={viewport} data-testid="execution-graph-viewport" data-zoom={zoom.toFixed(2)} data-pan={`${Math.round(pan.x)},${Math.round(pan.y)}`} className="execution-graph-viewport"
+        <div ref={viewport} data-testid="execution-graph-viewport" data-zoom={zoom.toFixed(2)} data-pan={`${Math.round(pan.x)},${Math.round(pan.y)}`} className="execution-graph-viewport" style={{ touchAction: 'none' }}
           onWheel={event => { event.preventDefault(); zoomBy(event.deltaY > 0 ? -0.08 : 0.08); }}
-          onMouseDown={event => { if (event.button !== 0) return; const start = point(event.clientX, event.clientY); dragState.current = { startX: start.x, startY: start.y, panX: pan.x, panY: pan.y }; }}
-          onMouseMove={event => { const drag = dragState.current; if (!drag) return; const next = point(event.clientX, event.clientY); setPan({ x: drag.panX + next.x - drag.startX, y: drag.panY + next.y - drag.startY }); }}
-          onMouseUp={() => { dragState.current = null; }} onMouseLeave={() => { dragState.current = null; }}>
+          onPointerDown={beginDrag} onMouseDown={beginDrag}
+          onPointerMove={moveDrag} onMouseMove={moveDrag}
+          onPointerUp={endDrag} onMouseUp={endDrag} onPointerCancel={endDrag}
+          onPointerLeave={endDrag} onMouseLeave={endDrag}>
           <svg ref={svg} width="100%" height="100%" viewBox={`0 0 ${size.width} ${size.height}`} role="img" aria-label={t('delivery.graphAria')}>
             <g ref={content} transform={`translate(${pan.x} ${pan.y}) scale(${zoom})`}>
               {lanes.map((lane, index) => <g key={lane} data-testid="execution-graph-lane">
@@ -1266,7 +1280,8 @@ function DeliveryWorkbench({ agents, progress, artifacts, artifactsLoading, onEx
   const [pinnedDispatch, setPinnedDispatch] = useState<number | null>(null);
   const [pinnedAgent, setPinnedAgent] = useState<number | null>(null);
   const [selectedStepId, setSelectedStepId] = useState<number | null>(null);
-  const [railVisible, setRailVisible] = useState(() => window.innerWidth >= 760);
+  const isMobile = useIsMobile();
+  const [railVisible, setRailVisible] = useState(() => !isMobile);
   const [railWidth, setRailWidth] = useState(RAIL_DEFAULT_WIDTH);
   const railDrag = useRef<{ x: number; width: number } | null>(null);
   const [groupBy, setGroupBy] = useState<'agent' | 'time'>('agent');
@@ -1279,6 +1294,9 @@ function DeliveryWorkbench({ agents, progress, artifacts, artifactsLoading, onEx
   const selectedAgent = pinnedAgent !== null ? agents.find(agent => agent.agentId === pinnedAgent) : selectedEntry?.agent ?? attentionAgent ?? agents[agents.length - 1];
   const selectedStep = selectedEntry?.steps.find(step => step.stepId === selectedStepId);
   const selectedTraceNode = progress?.processGraph?.nodes.find(node => node.dispatchId === selectedEntry?.dispatchId);
+  const selectedArtifacts = useMemo(() => selectedAgent ? artifactsForAgent(selectedAgent, artifacts, progress?.executions) : artifacts, [selectedAgent, artifacts, progress?.executions]);
+  const selectedExecutions = useMemo(() => progress?.executions?.filter(attempt => !selectedAgent || attempt.agentId === selectedAgent.agentId), [progress?.executions, selectedAgent]);
+  const previewSequence = useMemo(() => artifactsInDisplayOrder(selectedAgent?.steps ?? [], selectedArtifacts, selectedExecutions), [selectedAgent, selectedArtifacts, selectedExecutions]);
   const selectedIsTimeout = selectedEntry?.attempt.status === 'TIMEOUT';
   const selectedLive = selectedEntry?.dispatchId === currentEntry?.dispatchId && currentAgent !== null;
   const [handoffId, setHandoffId] = useState<number | null>(null);
@@ -1463,7 +1481,7 @@ function DeliveryWorkbench({ agents, progress, artifacts, artifactsLoading, onEx
               { key: 'details', label: t('workbench.details'), children: details },
               { key: 'trace', label: t('trace.timeline'), children: selectedEntry ? <RuntimeTracePanel dispatchId={selectedEntry.dispatchId} status={selectedEntry.attempt.status ?? undefined} node={selectedTraceNode} processGraph={progress?.processGraph ?? undefined} visible={expanded && tab === 'trace'} /> : <Empty description={t('workbench.noSession')} /> },
               { key: 'timing', label: t('stepTiming.title'), children: selectedEntry ? <StepDurationChart key={selectedEntry.dispatchId} dispatchId={selectedEntry.dispatchId} steps={selectedEntry.attempt.stepTimings} /> : <Empty description={t('workbench.noSession')} /> },
-              { key: 'artifacts', label: t('artifacts.agentCount', { count: selectedAgent ? artifactsForAgent(selectedAgent, artifacts, progress?.executions).length : artifacts.length }), children: <ArtifactGroup key={selectedAgent?.agentId ?? 'all'} executions={progress?.executions?.filter(attempt => !selectedAgent || attempt.agentId === selectedAgent.agentId)} steps={selectedAgent?.steps ?? []} artifacts={selectedAgent ? artifactsForAgent(selectedAgent, artifacts, progress?.executions) : artifacts} loading={artifactsLoading} onPreview={setPreviewArtifact} /> },
+              { key: 'artifacts', label: t('artifacts.agentCount', { count: selectedArtifacts.length }), children: <ArtifactGroup key={selectedAgent?.agentId ?? 'all'} executions={selectedExecutions} steps={selectedAgent?.steps ?? []} artifacts={selectedArtifacts} loading={artifactsLoading} onPreview={setPreviewArtifact} /> },
             ]} />
           </main>
         </div>
@@ -1471,6 +1489,7 @@ function DeliveryWorkbench({ agents, progress, artifacts, artifactsLoading, onEx
       <ArtifactPreviewModal
         open={expanded && previewArtifact != null}
         artifact={previewArtifact}
+        artifacts={previewSequence}
         onClose={() => setPreviewArtifact(null)}
       />
     </Modal>

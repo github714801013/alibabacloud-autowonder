@@ -11,6 +11,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -18,6 +19,9 @@ import java.util.Map;
 
 @Service
 public class RuntimeTraceService {
+
+    private static final int DEFAULT_TRACE_WINDOW = 100;
+    private static final int MAX_TRACE_WINDOW = 500;
 
     private final DispatchDao dispatchDao;
     private final DispatchRuntimeEventDao eventDao;
@@ -56,19 +60,84 @@ public class RuntimeTraceService {
     }
 
     public RuntimeTraceVO get(long tenantId, long dispatchId, Long afterSeq) {
+        return get(tenantId, dispatchId, afterSeq, null, null);
+    }
+
+    /**
+     * 归档大纲与库内窗口使用同一套裁剪规则：排除 agent.message，最多 MAX_TRACE_WINDOW 条。
+     * 归档事件没有库内 id，beforeId/nextBeforeId 改用事件数组下标，服务端每次请求都会重新解析大纲，下标稳定。
+     */
+    public static RuntimeTraceVO windowCompleted(RuntimeTraceVO trace, Integer limit, Long beforeIndex) {
+        if (limit == null && beforeIndex == null) {
+            return trace;
+        }
+        if (limit != null && limit <= 0) {
+            throw new BizException(ErrorCode.PARAM_INVALID);
+        }
+        int windowSize = limit == null ? DEFAULT_TRACE_WINDOW : Math.min(limit, MAX_TRACE_WINDOW);
+        List<RuntimeTraceVO.Event> all = trace.getEvents() == null ? List.of() : trace.getEvents();
+        List<RuntimeTraceVO.Event> sources = new ArrayList<>(all.size());
+        for (RuntimeTraceVO.Event event : all) {
+            if (!"agent.message".equals(event.getEventType())) {
+                sources.add(event);
+            }
+        }
+        int end = sources.size();
+        if (beforeIndex != null) {
+            end = (int) Math.max(0L, Math.min((long) end, beforeIndex));
+        }
+        int start = Math.max(0, end - windowSize);
+        trace.setEvents(new ArrayList<>(sources.subList(start, end)));
+        trace.setNextBeforeId(start > 0 ? (long) start : null);
+        return trace;
+    }
+
+    /**
+     * 窗口轨迹：带 limit 或 beforeId 时排除 agent.message 且只返回最新窗口；
+     * 会话/轮次/span/token 仍从全部非消息事件折叠。
+     */
+    public RuntimeTraceVO get(long tenantId, long dispatchId, Long afterSeq, Integer limit, Long beforeId) {
         DispatchDO dispatch = dispatchDao.findById(dispatchId);
         if (dispatch == null || dispatch.getTenantId() == null || dispatch.getTenantId() != tenantId) {
             throw new BizException(ErrorCode.DISPATCH_NOT_FOUND);
         }
+        if (limit != null && limit <= 0) {
+            throw new BizException(ErrorCode.PARAM_INVALID);
+        }
+        boolean windowed = limit != null || beforeId != null;
+        int windowSize = limit == null ? DEFAULT_TRACE_WINDOW : Math.min(limit, MAX_TRACE_WINDOW);
+        if (windowed && beforeId == null && afterSeq != null) {
+            Long latest = eventDao.findLatestIdForTrace(tenantId, dispatchId);
+            if (latest == null || latest <= afterSeq) {
+                RuntimeTraceVO unchanged = new RuntimeTraceVO();
+                unchanged.setDispatchId(dispatchId);
+                unchanged.setLastSeq(latest == null ? 0L : latest);
+                unchanged.setChanged(false);
+                return unchanged;
+            }
+        }
         // seq is numbered by each executor runtime: after a failover re-run the second runtime
         // restarts the count, so trace order and the changed cursor must use the arrival id.
-        List<DispatchRuntimeEventDO> sources = eventDao.listByDispatchInArrivalOrder(tenantId, dispatchId);
+        List<DispatchRuntimeEventDO> sources = windowed
+                ? eventDao.listByDispatchForTrace(tenantId, dispatchId)
+                : eventDao.listByDispatchInArrivalOrder(tenantId, dispatchId);
         long lastSeq = sources.stream().map(DispatchRuntimeEventDO::getId)
                 .filter(java.util.Objects::nonNull).mapToLong(Long::longValue).max().orElse(0L);
+        int windowStart = 0;
+        int windowEnd = sources.size();
+        if (windowed) {
+            if (beforeId != null) {
+                windowEnd = 0;
+                while (windowEnd < sources.size() && idOf(sources.get(windowEnd)) < beforeId) {
+                    windowEnd++;
+                }
+            }
+            windowStart = Math.max(0, windowEnd - windowSize);
+        }
         RuntimeTraceVO trace = new RuntimeTraceVO();
         trace.setDispatchId(dispatchId);
         trace.setLastSeq(lastSeq);
-        if (afterSeq != null && lastSeq <= afterSeq) {
+        if (beforeId == null && afterSeq != null && lastSeq <= afterSeq) {
             trace.setChanged(false);
             return trace;
         }
@@ -80,9 +149,12 @@ public class RuntimeTraceService {
         Map<String, Instant> sessionLastEvent = new LinkedHashMap<>();
         String currentStepId = null;
         String currentStepName = null;
-        for (DispatchRuntimeEventDO source : sources) {
+        for (int i = 0; i < sources.size(); i++) {
+            DispatchRuntimeEventDO source = sources.get(i);
             RuntimeTraceVO.Event event = toEvent(source);
-            trace.getEvents().add(event);
+            if (!windowed || (i >= windowStart && i < windowEnd)) {
+                trace.getEvents().add(event);
+            }
             String eventType = source.getEventType() == null ? "" : source.getEventType();
             if ("step.started".equals(eventType)) {
                 currentStepId = first(text(event.getDetail(), "stepId"), source.getStepKey());
@@ -112,7 +184,6 @@ public class RuntimeTraceService {
                 trace.getSessions().add(created);
                 return created;
             });
-            session.getEventIds().add(source.getEventId());
             applySessionLifecycle(session, eventType, event);
 
             String turnId = text(event.getDetail(), "turnId");
@@ -130,7 +201,6 @@ public class RuntimeTraceService {
                 session.getTurns().add(created);
                 return created;
             });
-            turn.getEventIds().add(source.getEventId());
             applyTurnLifecycle(turn, eventType, event);
 
             String kind = spanKind(eventType, event.getDetail());
@@ -148,12 +218,14 @@ public class RuntimeTraceService {
                         turn.getSpans().add(created);
                         return created;
                     });
-            span.getEventIds().add(source.getEventId());
             applySpan(span, eventType, event);
             if ("llm.usage".equals(eventType)) {
                 addUsage(span.getTokenUsage(), event.getDetail());
                 addUsage(turn.getTokenUsage(), event.getDetail());
             }
+        }
+        if (windowed && windowStart > 0 && windowEnd > windowStart) {
+            trace.setNextBeforeId(idOf(sources.get(windowStart)));
         }
         for (RuntimeTraceVO.Session session : trace.getSessions()) {
             for (RuntimeTraceVO.Turn turn : session.getTurns()) {
@@ -225,6 +297,10 @@ public class RuntimeTraceService {
             pendingMessage = null;
         }
         return timeline;
+    }
+
+    private static long idOf(DispatchRuntimeEventDO event) {
+        return event.getId() == null ? 0L : event.getId();
     }
 
     private static RuntimeActivityTimelineVO.Activity activityOf(DispatchRuntimeEventDO source, String level,

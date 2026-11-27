@@ -4,7 +4,7 @@ import { PageHead } from '@/shared/ui/PageHead';
 import { NoticeTip } from '@/shared/ui/NoticeTip';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { Button, Form, Input, Tag, Tooltip, message } from 'antd';
+import { Alert, Button, Form, Input, Tag, Tooltip, message } from 'antd';
 import { AwStrokeIcon } from '@/shared/ui/AwStrokeIcon';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { McpTokenSettingsPanel } from '@/features/open-platform/McpTokenSettingsPanel';
@@ -16,11 +16,14 @@ import {
   USER_IM_IDENTITIES_QUERY_KEY,
   USER_PROFILE_QUERY_KEY,
   getMyProfile,
+  getMyWecomIdentityTest,
   listMyImIdentities,
   sendMyDingTalkIdentityTest,
   updateMyDingTalkIdentity,
   updateMyFeishuIdentity,
   sendMyFeishuIdentityTest,
+  sendMyWecomIdentityTest,
+  updateMyWecomIdentity,
   type UserImIdentity,
 } from './profileApi';
 import {
@@ -47,6 +50,24 @@ const EMPTY_IM_IDENTITY: UserImIdentity = {
   testAvailable: false,
 };
 
+const WECOM_TEST_STATUS_LABEL_KEYS = {
+  QUEUED: 'im.testStatusQueued',
+  SENT: 'im.testStatusSent',
+  FAILED: 'im.testStatusFailed',
+  UNKNOWN: 'im.testStatusUnknown',
+  NONE: 'im.testStatusNone',
+} as const;
+
+const WECOM_TEST_STATUS_COLORS: Readonly<Record<string, string>> = {
+  QUEUED: 'gold',
+  SENT: 'green',
+  FAILED: 'red',
+  UNKNOWN: 'orange',
+  NONE: 'default',
+};
+
+const WECOM_TEST_POLL_LIMIT = 20;
+
 function getApiMessage(error: unknown, fallback: string) {
   return error instanceof Error && error.message ? error.message : fallback;
 }
@@ -70,6 +91,7 @@ export function ProfileSettingsPage() {
     : DEFAULT_TAB;
   const [visitedTabs, setVisitedTabs] = useState<Set<ProfileTabKey>>(() => new Set([activeTab]));
   const [form] = Form.useForm<ImIdentityFormValues>();
+  const [wecomTestKey, setWecomTestKey] = useState<string | null>(null);
   const queryClient = useQueryClient();
   const hydratedRef = useRef(false);
   const identityQuery = useQuery({
@@ -95,8 +117,26 @@ export function ProfileSettingsPage() {
 
   const identityRow = identityQuery.data?.[0];
   const provider = identityRow?.provider ?? 'DINGTALK';
-  const providerLabel = provider === 'FEISHU' ? t('im.feishu') : provider === 'DINGTALK' ? t('im.dingtalk') : provider;
+  const isWecom = provider === 'WECOM';
   const isFeishu = provider === 'FEISHU';
+  const providerLabel = provider === 'FEISHU' ? t('im.feishu') : provider === 'WECOM' ? t('im.wecom') : provider === 'DINGTALK' ? t('im.dingtalk') : provider;
+  // 企业微信测试通知由通知工人异步投递，按 deliveryKey 有界轮询到终态；排队不等于送达。
+  const wecomTestQuery = useQuery({
+    queryKey: ['wecom-im-test-status', wecomTestKey],
+    queryFn: getMyWecomIdentityTest,
+    enabled: isWecom && Boolean(wecomTestKey),
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      if (status && status !== 'QUEUED' && status !== 'NONE') return false;
+      // 成功与失败都计入上限，避免查询持续报错时无限轮询。
+      const attempts = query.state.dataUpdateCount + query.state.errorUpdateCount;
+      return attempts >= WECOM_TEST_POLL_LIMIT ? false : 1500;
+    },
+  });
+  const wecomTestStatus = isWecom ? wecomTestQuery.data?.status ?? (wecomTestKey ? 'QUEUED' : null) : null;
+  const wecomTestStatusKey = wecomTestStatus
+    ? WECOM_TEST_STATUS_LABEL_KEYS[wecomTestStatus as keyof typeof WECOM_TEST_STATUS_LABEL_KEYS]
+    : undefined;
   const hydratedProviderRef = useRef(provider);
   const hasIdentityRow = Boolean(identityRow);
   const identity = identityRow || EMPTY_IM_IDENTITY;
@@ -122,10 +162,17 @@ export function ProfileSettingsPage() {
     }
   }, [form, identityQuery.data, savedExternalUserId, provider]);
 
+  useEffect(() => {
+    if (!isWecom) setWecomTestKey(null);
+  }, [isWecom]);
+
   const saveMutation = useMutation({
     mutationFn: async () => {
       const values = await form.validateFields();
-      return (provider === 'FEISHU' ? updateMyFeishuIdentity : updateMyDingTalkIdentity)({ externalUserId: values.externalUserId?.trim() || '' });
+      const update = provider === 'FEISHU'
+        ? updateMyFeishuIdentity
+        : provider === 'WECOM' ? updateMyWecomIdentity : updateMyDingTalkIdentity;
+      return update({ externalUserId: values.externalUserId?.trim() || '' });
     },
     onSuccess: async () => {
       message.success(i18n.t('profile:im.saved'));
@@ -137,9 +184,18 @@ export function ProfileSettingsPage() {
   });
 
   const testMutation = useMutation({
-    mutationFn: () => (provider === 'FEISHU' ? sendMyFeishuIdentityTest() : sendMyDingTalkIdentityTest()),
+    mutationFn: async () => {
+      if (provider === 'WECOM') {
+        const started = await sendMyWecomIdentityTest();
+        setWecomTestKey(started.deliveryKey);
+        return started;
+      }
+      if (provider === 'FEISHU') await sendMyFeishuIdentityTest();
+      else await sendMyDingTalkIdentityTest();
+      return null;
+    },
     onSuccess: () => {
-      message.success(i18n.t('profile:im.testSent'));
+      message.success(i18n.t(provider === 'WECOM' ? 'profile:im.testQueued' : 'profile:im.testSent'));
     },
     onError: (error) => {
       message.error(getApiMessage(error, i18n.t('profile:im.testFailed')));
@@ -236,13 +292,20 @@ export function ProfileSettingsPage() {
                 <div className="prof-channel-tags">
                   <Tag color={hasSavedIdentity ? 'green' : undefined}>{hasSavedIdentity ? t('im.enabled') : t('im.disabled')}</Tag>
                   <Tag color={identity.testAvailable ? 'green' : 'gold'}>{testStatusText}</Tag>
+                  {isWecom && wecomTestStatus && wecomTestStatusKey && (
+                    <Tag color={WECOM_TEST_STATUS_COLORS[wecomTestStatus] ?? 'default'}>
+                      {t(wecomTestStatusKey)}
+                    </Tag>
+                  )}
                 </div>
               </div>
 
+              {isWecom && <Alert type="info" showIcon message={t('im.wecomPrivateChat')} />}
+
               <Form.Item
-                label={t('im.label', { provider: providerLabel })}
+                label={isWecom ? t('im.wecomLabel') : t('im.label', { provider: providerLabel })}
                 name="externalUserId"
-                extra={isFeishu ? t('im.feishuHint') : t('im.dingtalkHint')}
+                extra={isWecom ? t('im.wecomHint') : isFeishu ? t('im.feishuHint') : t('im.dingtalkHint')}
                 style={{ marginTop: 14 }}
               >
                 <Input maxLength={256} placeholder={t('im.placeholder')} autoComplete="off" />

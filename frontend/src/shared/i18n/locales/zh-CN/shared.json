@@ -241,5 +241,11 @@
   },
   "table": {
     "total_other": "共 {{count}} 条"
+  },
+  "quote": {
+    "pill": "引用此内容",
+    "cardLabel": "引用内容",
+    "remove": "移除引用",
+    "truncated": "引用内容已截断"
   }
 }

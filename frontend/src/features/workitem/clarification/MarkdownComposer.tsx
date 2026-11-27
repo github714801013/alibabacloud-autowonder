@@ -3,7 +3,6 @@ import { Editor, InputRule } from '@tiptap/core';
 import { EditorContent, useEditor } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import Placeholder from '@tiptap/extension-placeholder';
-import Table from '@tiptap/extension-table';
 import TableRow from '@tiptap/extension-table-row';
 import TableCell from '@tiptap/extension-table-cell';
 import TableHeader from '@tiptap/extension-table-header';
@@ -17,6 +16,7 @@ import {
   pastedFileForUpload,
 } from '@/shared/lib/documentUpload';
 import { shouldSendOnKey, type SendMode } from './sendMode';
+import { MarkdownTable } from './markdownTable';
 import './markdownComposer.css';
 
 export interface MarkdownComposerHandle {
@@ -93,7 +93,7 @@ export function MarkdownComposer({
     extensions: [
       StarterKit,
       Placeholder.configure({ placeholder: () => placeholderRef.current }),
-      Table.configure({ resizable: false }),
+      MarkdownTable.configure({ resizable: false }),
       TableRow,
       TableCell,
       TableHeader,
@@ -139,10 +139,12 @@ export function MarkdownComposer({
       },
     },
     onUpdate: ({ editor: current, transaction }) => {
-      // setEditable 的 dispatch 未带 preventUpdate：disabled 切换（回复中/创建中）会以
-      // 旧内容触发一次 update，把刚被外部清空的草稿写回 state。这类「非内容变化」的事务跳过。
+      // setEditable 的 dispatch 未带 preventUpdate：disabled 切换（回复中/创建中）会带着
+      // 编辑器当前内容触发一次 update。非文档变化的事务只在内容尚未上报时补发一次；
+      // 与已上报内容一致的旧内容不回写，避免覆盖外部清空或刚回填的草稿。
       if (transaction.getMeta('preventUpdate') || !current.isEditable) return;
       const md = current.storage.markdown.getMarkdown();
+      if (!transaction.docChanged && md === lastEmittedRef.current) return;
       lastEmittedRef.current = md;
       onChange(md);
     },

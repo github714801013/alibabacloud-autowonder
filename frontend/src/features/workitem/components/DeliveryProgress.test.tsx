@@ -15,6 +15,28 @@ const traceFixture = (dispatchId: number, usage: Partial<RuntimeTraceTokenUsage>
   tokenUsage: { available: false, inputTokens: 0, outputTokens: 0, reasoningTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0, ...usage },
 });
 
+// jsdom 没有 PointerEvent 构造器，fireEvent.pointer* 会丢失坐标，用 MouseEvent 派生 pointer 事件
+function firePointer(type: 'pointerdown' | 'pointermove' | 'pointerup', target: HTMLElement, coords: { clientX?: number; clientY?: number } = {}) {
+  fireEvent(target, new MouseEvent(type, { bubbles: true, cancelable: true, ...coords }));
+}
+
+function stubMobileMatchMedia() {
+  vi.stubGlobal('matchMedia', (query: string) => ({
+    matches: query.includes('767.98px'),
+    media: query,
+    onchange: null,
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    dispatchEvent: vi.fn(),
+  }));
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
 beforeEach(() => {
   // ResizeObserver is a browser API missing only in jsdom; keep the stub test-local.
   vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
@@ -85,6 +107,27 @@ describe('formatDuration', () => {
 });
 
 describe('DeliveryProgress', () => {
+  it('hides the workbench sidebar by default on mobile', () => {
+    stubMobileMatchMedia();
+    const progress: DeliveryProgressModel = {
+      steps: [],
+      agents: [{
+        agentId: 41, agentName: '开发', status: 'active', durationMs: null,
+        steps: [{
+          stepId: 101, name: '开发', status: 'active', agentName: '开发', executorName: null,
+          error: null, subSteps: null, durationMs: null,
+          attempts: [{ dispatchId: 301, agentName: '开发', executorName: null, status: 'RUNNING', startedAt: null, durationMs: null }],
+        }],
+      }],
+    };
+    render(<DeliveryProgress progress={progress} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '查看执行' }));
+
+    const rail = within(screen.getByTestId('delivery-workbench')).getByRole('complementary', { hidden: true });
+    expect(rail).toHaveAttribute('hidden');
+  });
+
   it('follows the selected session in the workbench control history', async () => {
     const progress: DeliveryProgressModel = { steps: [], executions: [301, 302].map(dispatchId => ({
       dispatchId, agentId: 41, agentName: 'RD', executorName: null, status: 'PAUSED', startedAt: null, durationMs: null,
@@ -1347,6 +1390,55 @@ describe('DeliveryProgress', () => {
     vi.unstubAllGlobals();
   });
 
+  it('navigates same-suffix artifacts from the workbench artifact preview', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => new Response(
+      String(input) === '/api/artifacts/1/preview' ? '# Dev Summary\nPASS' : '# QA Report\nPASS', { status: 200 })));
+    server.use(http.get('/api/artifacts/:id/download', ({ params }) => HttpResponse.json({
+      success: true, code: '0', message: '', traceId: null,
+      data: params.id === '1' ? 'https://oss.example/dev-summary.md' : 'https://oss.example/qa-report.md',
+    })));
+    const progress: DeliveryProgressModel = {
+      steps: [],
+      agents: [{
+        agentId: 41,
+        agentName: 'Agent Dev',
+        status: 'finished',
+        durationMs: 120_000,
+        steps: [{
+          stepId: 101,
+          name: '编码实现',
+          status: 'done',
+          agentName: 'Agent Dev', executorName: null,
+          error: null,
+          subSteps: null,
+          durationMs: 120_000,
+          attempts: [
+            { dispatchId: 301, agentName: 'Agent Dev', executorName: null, status: 'SUCCEEDED', error: null, startedAt: null, durationMs: 120_000 },
+          ],
+        }],
+      }],
+    };
+    const artifacts: Artifact[] = [
+      { id: 1, workitemId: 100, dispatchId: 301, name: 'dev-summary.md', type: 'MARKDOWN', size: 1024, gmtCreate: '' },
+      { id: 2, workitemId: 100, dispatchId: 301, name: 'qa-report.md', type: 'MARKDOWN', size: 1024, gmtCreate: '' },
+    ];
+
+    render(<DeliveryProgress progress={progress} artifacts={artifacts} />);
+
+    await openArtifacts();
+    fireEvent.click(screen.getByText(/其他文件（/));
+    fireEvent.click(screen.getByRole('button', { name: '预览产物 dev-summary.md' }));
+
+    expect(await screen.findByRole('heading', { name: 'Dev Summary' })).toBeInTheDocument();
+    expect(screen.getByText('1 / 2')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '下一个' }));
+    expect(await screen.findByRole('heading', { name: 'QA Report' })).toBeInTheDocument();
+    expect(screen.getByText('2 / 2')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /下载/ })).toHaveAttribute('href', 'https://oss.example/qa-report.md');
+
+    vi.unstubAllGlobals();
+  });
+
   it('downloads agent artifacts without opening a popup tab', async () => {
     server.use(http.get('/api/artifacts/1/download', () => HttpResponse.json({
       success: true, code: '0', message: '', traceId: null, data: 'https://oss.example/dev-summary.md',
@@ -1570,7 +1662,6 @@ describe('DeliveryProgress', () => {
             sessionId: 's1', parentSessionId: null, status: 'INTERRUPTED',
             startedAt: '2026-07-30T10:00:00Z', endedAt: '2026-07-30T10:01:06Z', durationMs: 10000,
             tokenUsage: { available: true, inputTokens: 1700, outputTokens: 400, reasoningTokens: 80, cacheReadTokens: 400, cacheWriteTokens: 0, totalTokens: 2100, credits: 12.34 },
-            eventIds: [],
             boundaries: [
               { eventId: '302:1', kind: 'RESUMED', eventTime: '2026-07-30T10:00:00Z', label: 'RESUMED' },
               { eventId: '302:15', kind: 'INTERRUPTED', eventTime: '2026-07-30T10:01:06Z', label: 'INTERRUPTED · paused · checkpoint #18' },
@@ -1580,11 +1671,10 @@ describe('DeliveryProgress', () => {
               startedAt: '2026-07-30T10:01:01Z', endedAt: '2026-07-30T10:01:05Z', durationMs: 4000,
               prompt: 'Run the implementation tests', systemPrompt: 'Follow the worker SDLC',
               tokenUsage: { available: true, inputTokens: 500, outputTokens: 100, reasoningTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 600 },
-              eventIds: [],
               spans: [
-                { spanId: 't2:llm', parentSpanId: null, kind: 'LLM', name: 'gpt-5', status: 'COMPLETED', startedAt: '2026-07-30T10:01:01Z', endedAt: '2026-07-30T10:01:04Z', durationMs: 3000, model: 'gpt-5', inputSummary: null, outputSummary: null, errorCategory: null, tokenUsage: { available: true, inputTokens: 500, outputTokens: 100, reasoningTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 600 }, eventIds: [] },
-                { spanId: 'thinking-1', parentSpanId: 't2:llm', kind: 'THINKING', name: 'Thinking', status: 'COMPLETED', startedAt: '2026-07-30T10:01:01Z', endedAt: '2026-07-30T10:01:02Z', durationMs: 1000, model: 'gpt-5', inputSummary: null, outputSummary: null, errorCategory: null, tokenUsage: { available: false, inputTokens: 0, outputTokens: 0, reasoningTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0 }, eventIds: [] },
-                { spanId: 'bash-1', parentSpanId: 't2', kind: 'BASH', name: 'bash', status: 'COMPLETED', startedAt: '2026-07-30T10:01:02Z', endedAt: '2026-07-30T10:01:03Z', durationMs: 1000, model: null, inputSummary: 'pnpm test', outputSummary: '26 passed', input: { command: 'pnpm test' }, output: '26 passed', errorCategory: null, tokenUsage: { available: false, inputTokens: 0, outputTokens: 0, reasoningTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0 }, eventIds: [] },
+                { spanId: 't2:llm', parentSpanId: null, kind: 'LLM', name: 'gpt-5', status: 'COMPLETED', startedAt: '2026-07-30T10:01:01Z', endedAt: '2026-07-30T10:01:04Z', durationMs: 3000, model: 'gpt-5', inputSummary: null, outputSummary: null, errorCategory: null, tokenUsage: { available: true, inputTokens: 500, outputTokens: 100, reasoningTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 600 } },
+                { spanId: 'thinking-1', parentSpanId: 't2:llm', kind: 'THINKING', name: 'Thinking', status: 'COMPLETED', startedAt: '2026-07-30T10:01:01Z', endedAt: '2026-07-30T10:01:02Z', durationMs: 1000, model: 'gpt-5', inputSummary: null, outputSummary: null, errorCategory: null, tokenUsage: { available: false, inputTokens: 0, outputTokens: 0, reasoningTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0 } },
+                { spanId: 'bash-1', parentSpanId: 't2', kind: 'BASH', name: 'bash', status: 'COMPLETED', startedAt: '2026-07-30T10:01:02Z', endedAt: '2026-07-30T10:01:03Z', durationMs: 1000, model: null, inputSummary: 'pnpm test', outputSummary: '26 passed', input: { command: 'pnpm test' }, output: '26 passed', errorCategory: null, tokenUsage: { available: false, inputTokens: 0, outputTokens: 0, reasoningTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0 } },
               ],
             }],
           }],
@@ -1737,6 +1827,13 @@ describe('DeliveryProgress', () => {
     fireEvent.mouseDown(viewport, { button: 2, clientX: 100, clientY: 100 });
     fireEvent.mouseMove(viewport, { clientX: 200, clientY: 200 });
     expect(viewport).toHaveAttribute('data-pan', '204,12');
+    // 视口改挂 pointer 事件：触屏拖拽同样生效，pointerup 后移动不再平移（坐标按官方图几何重算）。
+    firePointer('pointerdown', viewport, { clientX: 100, clientY: 100 });
+    firePointer('pointermove', viewport, { clientX: 124, clientY: 116 });
+    expect(viewport).toHaveAttribute('data-pan', '216,16');
+    firePointer('pointerup', viewport, { clientX: 124, clientY: 116 });
+    firePointer('pointermove', viewport, { clientX: 300, clientY: 300 });
+    expect(viewport).toHaveAttribute('data-pan', '216,16');
 
     fireEvent.click(screen.getByLabelText('重置视图'));
     expect(viewport).toHaveAttribute('data-zoom', '1.00');
@@ -2392,7 +2489,8 @@ describe('DeliveryProgress workbench dispatch isolation', () => {
     expect(load).not.toHaveBeenCalled();
     fireEvent.click(within(workbench).getByRole('tab', { name: 'Trace 时间线' }));
     await within(workbench).findByText('Runtime 尚未上报 Session Trace');
-    expect(load).toHaveBeenCalledWith(402, null);
+    // 合并保留本地轨迹分页：加载需带 limit 窗口参数。
+    expect(load).toHaveBeenCalledWith(402, null, { limit: 100 });
     vi.useFakeTimers();
     try {
       fireEvent.click(within(workbench).getByRole('tab', { name: '控制记录' }));

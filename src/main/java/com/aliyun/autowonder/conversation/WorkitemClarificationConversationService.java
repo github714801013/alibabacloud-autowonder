@@ -39,6 +39,13 @@ public class WorkitemClarificationConversationService {
     private final ConversationExecutorRouter executorRouter;
     private final ClarificationAttachmentService attachmentService;
 
+    private ConversationAdmissionService admissionService;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setAdmissionService(ConversationAdmissionService admissionService) {
+        this.admissionService = admissionService;
+    }
+
     public WorkitemClarificationConversationService(AgentConversationDao convDao,
             AgentConversationTurnDao turnDao, AgentConversationService conversationService,
             AgentDao agentDao,
@@ -230,8 +237,12 @@ public class WorkitemClarificationConversationService {
         if (agent == null) {
             throw new KeyedIllegalArgumentException("conversation.agent_not_found", null, "agent not found");
         }
-        Long executorId = executorRouter.select(tenantId, agentId,
-                requireOnlineVersion(agent), null);
+        Long onlineVersionId = requireOnlineVersion(agent);
+        Long executorId = admissionService == null ? null
+                : admissionService.selectNewConversation(tenantId, agentId, onlineVersionId, false);
+        if (executorId == null) {
+            executorId = executorRouter.select(tenantId, agentId, onlineVersionId, null);
+        }
 
         AgentConversationDO conv = new AgentConversationDO();
         conv.setTenantId(tenantId);
@@ -245,6 +256,9 @@ public class WorkitemClarificationConversationService {
         conv.setStatus("ACTIVE");
         // 新建的空会话没有对话记录：不写 last_turn_at，默认会话选择只认「最近对话过」的会话。
         convDao.insert(conv);
+        if (executorId != null && admissionService != null) {
+            admissionService.recordBinding(tenantId, agentId, executorId);
+        }
 
         return toVO(conv, List.of());
     }
@@ -253,7 +267,7 @@ public class WorkitemClarificationConversationService {
     public void submitTurn(Long tenantId, Long workitemId, Long conversationId, Long userId,
             String content, String clientMessageId, List<Long> attachmentIds) {
         if (userId == null || userId <= 0) {
-            throw new BizException(ErrorCode.PARAM_INVALID);
+            throw new BizException(ErrorCode.UNAUTHORIZED);
         }
         AgentConversationDO conv = convDao.findById(tenantId, conversationId);
         if (conv == null) {
@@ -295,14 +309,13 @@ public class WorkitemClarificationConversationService {
             return;
         }
         AgentDO agent = agentDao.findById(conv.getAgentId());
-        Long executorId = executorRouter.select(tenantId, conv.getAgentId(),
-                requireOnlineVersion(agent), conv.getExecutorId());
-        if (executorId == null && !executorRouter.canQueueOnOwner(tenantId, conv.getAgentId(),
-                requireOnlineVersion(agent), conv.getExecutorId(), false)) {
-            throw new BizException(ErrorCode.CLARIFICATION_EXECUTOR_OFFLINE);
-        }
+        Long executorId = requireDispatchableExecutor(tenantId, conv, agent);
         if (executorId != null && !executorId.equals(conv.getExecutorId())) {
+            boolean firstBinding = conv.getExecutorId() == null;
             convDao.updateExecutor(tenantId, conversationId, executorId);
+            if (firstBinding && admissionService != null) {
+                admissionService.recordBinding(tenantId, conv.getAgentId(), executorId);
+            }
         }
         List<Long> bindableIds = attachmentService.requireBindableIds(
                 tenantId, conversationId, userId, attachmentIds);
@@ -329,6 +342,40 @@ public class WorkitemClarificationConversationService {
             throw new KeyedIllegalArgumentException("conversation.workitem_mismatch", null, "conversation does not belong to this workitem");
         }
         conversationService.requestTurnCancel(tenantId, conversationId, turnId);
+    }
+
+    @Transactional
+    public void retryTurn(Long tenantId, Long workitemId, Long conversationId, Long turnId) {
+        AgentConversationDO conv = convDao.findById(tenantId, conversationId);
+        if (conv == null) {
+            throw new KeyedIllegalArgumentException("conversation.not_found", null, "conversation not found");
+        }
+        if (!CHANNEL.equals(conv.getChannel()) || !BIZ_REF_TYPE.equals(conv.getBizRefType())
+                || !workitemId.equals(conv.getBizRefId())) {
+            throw new KeyedIllegalArgumentException("conversation.workitem_mismatch", null, "conversation does not belong to this workitem");
+        }
+        // 与发送同一口径先判执行器：离线时直接报错，不让轮次脱离 FAILED。
+        requireDispatchableExecutor(tenantId, conv, agentDao.findById(conv.getAgentId()));
+        conversationService.retryTurn(tenantId, conversationId, turnId);
+    }
+
+    private Long requireDispatchableExecutor(Long tenantId, AgentConversationDO conv, AgentDO agent) {
+        if (conv.getExecutorId() != null) {
+            // 会话硬绑自身执行器：在线但无剩余容量时入队，离线明确报错，不回落其他机器。
+            Long executorId = executorRouter.selectStrict(tenantId, conv.getAgentId(),
+                    requireOnlineVersion(agent), conv.getExecutorId());
+            if (executorId == null && !executorRouter.canQueueOnOwner(tenantId, conv.getAgentId(),
+                    requireOnlineVersion(agent), conv.getExecutorId(), false)) {
+                throw new BizException(ErrorCode.CLARIFICATION_EXECUTOR_OFFLINE);
+            }
+            return executorId;
+        }
+        Long executorId = executorRouter.select(tenantId, conv.getAgentId(),
+                requireOnlineVersion(agent), null);
+        if (executorId == null) {
+            throw new BizException(ErrorCode.CLARIFICATION_EXECUTOR_OFFLINE);
+        }
+        return executorId;
     }
 
     private Long requireOnlineVersion(AgentDO agent) {

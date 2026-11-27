@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '@/shared/api/client';
 import { useAuthStore } from '@/shared/auth/store';
+import { syncRealtimeAuth } from '@/shared/realtime/client';
 import { ApiError, type SwitchWorkspaceResponse, type WorkspaceInfo } from '@/shared/types/common';
 import { refreshTenantScopedQueries } from '@/features/workitem/queryCache';
 
@@ -19,7 +20,9 @@ export function useSwitchWorkspace() {
     try {
       const resp = await apiClient.post<SwitchWorkspaceResponse>(`/api/workspaces/${workspace.id}/switch`);
       const { accessToken, accessLevel } = resp.data;
+      // 例外（D6）：官方原子更新 session 后即时重绑实时连接，避免切空间后旧 ws 连接残留。
       setWorkspaceSession(accessToken, workspace, accessLevel);
+      syncRealtimeAuth(accessToken);
       await refreshTenantScopedQueries(queryClient);
       navigate(destination);
       return true;

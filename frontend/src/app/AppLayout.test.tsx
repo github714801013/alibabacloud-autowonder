@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ReactElement } from 'react';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -46,6 +46,10 @@ describe('AppLayout', () => {
   beforeEach(() => {
     useAuthStore.getState().clear();
     vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it('keeps the header on public help without platform navigation or workspace refresh', async () => {
@@ -490,10 +494,18 @@ describe('AppLayout', () => {
     const originalMatchMedia = Object.getOwnPropertyDescriptor(window, 'matchMedia');
     Object.defineProperty(window, 'matchMedia', { writable: true, value: undefined });
     // Node 26 内置 localStorage 的方法是实例自有属性，需在实例上覆盖而非 spy 原型。
-    const storage = window.localStorage;
-    const originalGetItem = Object.getOwnPropertyDescriptor(storage, 'getItem');
+    const originalStorage = Object.getOwnPropertyDescriptor(window, 'localStorage');
     let reads = 0;
-    Object.defineProperty(storage, 'getItem', { configurable: true, value: () => { reads += 1; throw new Error('denied'); } });
+    const storage = {
+      getItem: () => { reads += 1; throw new Error('denied'); },
+      setItem: () => {},
+      removeItem: () => {},
+      clear: () => {},
+      key: () => null,
+      length: 0,
+    } as unknown as Storage;
+    Object.defineProperty(window, 'localStorage', { configurable: true, value: storage });
+    vi.stubGlobal('localStorage', storage);
     try {
       useAuthStore.getState().setCurrentWorkspace({ id: 7, name: '星云工坊', description: '' }, 'ADMIN');
       renderWithQueryClient(
@@ -510,9 +522,9 @@ describe('AppLayout', () => {
       expect(screen.getByRole('link', { name: '工单' })).toBeInTheDocument();
       expect(reads).toBeGreaterThan(0);
     } finally {
-      if (originalGetItem) Object.defineProperty(storage, 'getItem', originalGetItem);
-      else delete (storage as unknown as Record<string, unknown>).getItem;
       if (originalMatchMedia) Object.defineProperty(window, 'matchMedia', originalMatchMedia);
+      if (originalStorage) Object.defineProperty(window, 'localStorage', originalStorage);
+      vi.unstubAllGlobals();
     }
   });
 

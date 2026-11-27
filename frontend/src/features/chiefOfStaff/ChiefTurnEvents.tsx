@@ -10,8 +10,9 @@ import { createEventDisplaySource } from '@/features/workitem/clarification/even
 import { useEventSummaryFeed } from '@/features/workitem/clarification/useEventSummaryFeed';
 import { useEventViewport } from '@/features/workitem/clarification/useEventViewport';
 
-export function ChiefTurnEvents({ conversationId, turnId, processing, onContentChange, questionHistory, questionHistoryPaged, questionRefreshKey, answerDeliveries, onContinue, canContinue, onSettledQuestions }: {
+export function ChiefTurnEvents({ conversationId, turnId, processing, onContentChange, questionHistory, questionHistoryPaged, questionRefreshKey, answerDeliveries, onContinue, canContinue, onSettledQuestions, onExpiredQuestions }: {
   onSettledQuestions?: (conversationId: number, turnId: number, requestIds: readonly string[]) => void;
+  onExpiredQuestions?: (conversationId: number, turnId: number, requestIds: readonly string[]) => void;
   questionHistory?: ClarificationElicitation[] | null;
   questionHistoryPaged?: boolean;
   questionRefreshKey?: string;
@@ -55,6 +56,10 @@ export function ChiefTurnEvents({ conversationId, turnId, processing, onContentC
   useEffect(() => { onSettledQuestions?.(conversationId, turnId,
     [...new Set([...questionSettled.current, ...settledRequestIds])]); },
     [conversationId, turnId, settledRequestIds, onSettledQuestions]);
+  const expiredRequestIds = useMemo(() => nodes.filter(node => node.elicitation?.resolved
+    && node.elicitation.status === 'EXPIRED').map(node => node.elicitation!.requestId), [nodes]);
+  useEffect(() => { onExpiredQuestions?.(conversationId, turnId, expiredRequestIds); },
+    [conversationId, turnId, expiredRequestIds, onExpiredQuestions]);
   useLayoutEffect(() => { onContentChange?.(); }, [nodes, history, onContentChange]);
   return <div ref={viewport.ref} style={{ minHeight: processing ? 1 : viewport.height }}>
     <AutoConversationQuestionHistory base={`/api/platform/conversations/${conversationId}`} conversationId={conversationId}

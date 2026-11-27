@@ -1,6 +1,7 @@
 import { i18n } from '@/shared/i18n';
+import type { ReactNode } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { http, HttpResponse } from 'msw';
@@ -23,14 +24,22 @@ import { mockLatestClarificationConversation } from '@/test/mocks/clarificationL
 import type { ClarificationConversation } from './types';
 import { readClarifyView, writeClarifyView } from '../clarifyView';
 import { copyTextToClipboard } from '@/shared/lib/clipboard';
+import { useAuthStore } from '@/shared/auth/store';
+import { selectText, stubRangeRect } from '@/test/selection';
 import type { Artifact } from '@/shared/types/workitem';
 
 type RealtimeCallback = (event: { type: string; payload: unknown }) => void;
-const realtime = vi.hoisted(() => ({ callback: null as RealtimeCallback | null }));
+const realtime = vi.hoisted(() => ({
+  callback: null as RealtimeCallback | null,
+  // 官方管线里每个轮次内容/摘要 feed 都各自订阅 useRealtime，单槽 callback 只留最后
+  // 注册者；需要事件确实进入 useClarificationEvents 的用例用 all 广播给全部订阅者。
+  all: new Set<RealtimeCallback>(),
+}));
 
 vi.mock('@/shared/realtime/useRealtime', () => ({
   useRealtime: (_channel: unknown, opts: { onEvent: RealtimeCallback }) => {
     realtime.callback = opts.onEvent;
+    realtime.all.add(opts.onEvent);
   },
 }));
 
@@ -57,6 +66,8 @@ type PanelTestProps = {
   latest?: Partial<ClarificationConversation> | null;
   /** 自定义 /latest handler（加载态、失败等场景），优先于 latest。 */
   latestHandler?: HttpHandler;
+  headerPrefix?: ReactNode;
+  workitemTitle?: string;
 };
 
 function renderPanel({ latest, latestHandler, ...props }: PanelTestProps = {}) {
@@ -216,6 +227,27 @@ function mockElementHeight(el: Element, height: number) {
   } as DOMRect);
 }
 
+/** 模拟移动端视口：useIsMobile 以 max-width: 767.98px 判定（同 RightPanel 用例）。 */
+function stubMobileViewport() {
+  vi.stubGlobal('matchMedia', (query: string) => ({
+    matches: query.includes('767.98px'),
+    media: query,
+    onchange: null,
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    dispatchEvent: vi.fn(),
+  }));
+}
+
+/** 给滚动容器补上 jsdom 缺失的滚动度量：内容 1000px、视口 300px。 */
+function mockScrollMetrics(scrollEl: HTMLElement, scrollTop: number) {
+  Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1000 });
+  Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 300 });
+  Object.defineProperty(scrollEl, 'scrollTop', { configurable: true, value: scrollTop });
+}
+
 async function renderActiveConversation(props: PanelTestProps = {}) {
   writeClarificationPrefill('100', { squadId: 9, agentId: 42 });
   mockSquads();
@@ -275,6 +307,7 @@ describe('WorkitemClarificationPanel', () => {
   beforeEach(() => {
     window.localStorage.clear();
     realtime.callback = null;
+    realtime.all.clear();
   });
 
   // 选中页是「小队下拉 + 成员卡片按钮」，不再有第二级 agent 下拉。
@@ -285,6 +318,10 @@ describe('WorkitemClarificationPanel', () => {
     fireEvent.click(await screen.findByText('交付小队'));
     fireEvent.click(await screen.findByRole('button', { name: new RegExp(agentName) }));
   }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
 
   // 工单 56281：澄清候选只来自「小队 → 成员」。以前面板在有交付进度时改列交付历史里的
   // 数字人，评论 @ 出来的执行历史会反过来把候选限死，未参与过交付的澄清数字人直接消失。
@@ -453,6 +490,91 @@ describe('WorkitemClarificationPanel', () => {
     first.unmount();
     renderPanel({ fullscreen: true, initialConversationId: 7 });
     expect(await screen.findByDisplayValue(prompt)).toBeInTheDocument();
+  });
+
+  it('prefills the reclarify prompt when the work item already has a clarification result', async () => {
+    writeClarificationPrefill('100', { squadId: 9, agentId: 42 });
+    mockSquads();
+    mockConversationWithTurns(42);
+    server.use(
+      http.get('/api/workitems/:workitemId/clarification', () =>
+        HttpResponse.json({
+          success: true, code: '0', message: '', traceId: null,
+          data: { id: 1, workitemId: 100, contentMd: '已确认的澄清结果', gmtCreate: '', gmtModified: '' },
+        }),
+      ),
+    );
+
+    renderPanel();
+
+    expect(await screen.findByDisplayValue(
+      '请先阅读本工单已有的澄清结果和本次会话历史，在此基础上与我进行再次需求澄清：先简要复述你已确认的目标、范围和验收条件，再只针对新增、变更或仍未确认的点提问；不要重复已经确认的内容。',
+    )).toBeInTheDocument();
+  });
+
+  it('does not prefill the reclarify prompt when there is no clarification result', async () => {
+    writeClarificationPrefill('100', { squadId: 9, agentId: 42 });
+    mockSquads();
+    mockConversationWithTurns(42);
+    server.use(
+      http.get('/api/workitems/:workitemId/clarification', () =>
+        HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: null }),
+      ),
+    );
+
+    renderPanel();
+
+    await waitFor(() => expect(screen.getByText('你好，我想讨论需求')).toBeInTheDocument());
+    expect(screen.getByPlaceholderText('输入消息...')).toHaveValue('');
+  });
+
+  it('prefills the English reclarify prompt under the en-US locale', async () => {
+    writeClarificationPrefill('100', { squadId: 9, agentId: 42 });
+    mockSquads();
+    mockConversationWithTurns(42);
+    server.use(
+      http.get('/api/workitems/:workitemId/clarification', () =>
+        HttpResponse.json({
+          success: true, code: '0', message: '', traceId: null,
+          data: { id: 1, workitemId: 100, contentMd: '已确认的澄清结果', gmtCreate: '', gmtModified: '' },
+        }),
+      ),
+    );
+    await act(async () => { await i18n.changeLanguage('en-US'); });
+    try {
+      renderPanel();
+      expect(await screen.findByDisplayValue(
+        "Read this work item's existing clarification result and the current conversation history, then run another round of requirement clarification with me: first briefly restate the goals, scope, and acceptance criteria you have confirmed, then ask only about new, changed, or still-unconfirmed points; do not repeat what is already confirmed.",
+      )).toBeInTheDocument();
+    } finally {
+      await act(async () => { await i18n.changeLanguage('zh-CN'); });
+    }
+  });
+
+  it('keeps a draft typed before the clarification result arrives', async () => {
+    writeClarificationPrefill('100', { squadId: 9, agentId: 42 });
+    mockSquads();
+    mockConversationWithTurns(42);
+    let releaseClarification!: () => void;
+    const clarificationGate = new Promise<void>((resolve) => { releaseClarification = resolve; });
+    server.use(
+      http.get('/api/workitems/:workitemId/clarification', async () => {
+        await clarificationGate;
+        return HttpResponse.json({
+          success: true, code: '0', message: '', traceId: null,
+          data: { id: 1, workitemId: 100, contentMd: '已确认的澄清结果', gmtCreate: '', gmtModified: '' },
+        });
+      }),
+    );
+
+    renderPanel();
+    await screen.findByPlaceholderText('输入消息...');
+    await typeComposer('我自己写的草稿');
+    await act(async () => {
+      releaseClarification();
+      await new Promise((resolve) => { setTimeout(() => resolve(undefined), 0); });
+    });
+    expect(screen.getByPlaceholderText('输入消息...')).toHaveValue('我自己写的草稿');
   });
 
   it('clears prefill for unrelated workitems', () => {
@@ -926,6 +1048,87 @@ describe('WorkitemClarificationPanel', () => {
 
     await waitFor(() => expect(textarea).toHaveValue('请保留这条消息'));
     expect(await screen.findByText('消息发送失败，请重试')).toBeInTheDocument();
+  });
+
+  it('quotes the selected agent reply into the next message and clears it', async () => {
+    writeClarificationPrefill('100', { squadId: 9, agentId: 42 });
+    mockSquads();
+    mockConversationWithTurns(42);
+    useAuthStore.getState().setAccessLevel('ADMIN');
+    let submitted: unknown;
+    server.use(
+      http.post('/api/workitems/:workitemId/clarification-conversations/:conversationId/turns', async ({ request }) => {
+        submitted = await request.json();
+        return HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: null });
+      }),
+    );
+    stubRangeRect();
+    renderPanel();
+    const textarea = await screen.findByPlaceholderText('输入消息...');
+    const reply = await screen.findByText('好的，请说说你的想法');
+
+    selectText(reply);
+    fireEvent.click(screen.getByRole('button', { name: '引用此内容' }));
+    await typeComposer('按这个方向继续');
+    fireEvent.keyDown(textarea, { key: 'Enter', code: 'Enter', shiftKey: true });
+
+    await waitFor(() => expect(submitted).toMatchObject({ content: '> 好的，请说说你的想法\n\n按这个方向继续' }));
+    await waitFor(() => expect(screen.queryByText('引用内容')).not.toBeInTheDocument());
+    useAuthStore.setState({ accessLevel: null });
+  });
+
+  it('sends the quote alone when the composer is empty', async () => {
+    writeClarificationPrefill('100', { squadId: 9, agentId: 42 });
+    mockSquads();
+    mockConversationWithTurns(42);
+    useAuthStore.getState().setAccessLevel('ADMIN');
+    let submitted: unknown;
+    server.use(
+      http.post('/api/workitems/:workitemId/clarification-conversations/:conversationId/turns', async ({ request }) => {
+        submitted = await request.json();
+        return HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: null });
+      }),
+    );
+    stubRangeRect();
+    renderPanel();
+    const reply = await screen.findByText('好的，请说说你的想法');
+
+    selectText(reply);
+    fireEvent.click(screen.getByRole('button', { name: '引用此内容' }));
+    const sendButton = screen.getByRole('button', { name: '发送消息' });
+    expect(sendButton).toBeEnabled();
+    fireEvent.click(sendButton);
+
+    await waitFor(() => expect(submitted).toMatchObject({ content: '> 好的，请说说你的想法' }));
+    useAuthStore.setState({ accessLevel: null });
+  });
+
+  it('restores the quote when quoting a reply fails to send', async () => {
+    writeClarificationPrefill('100', { squadId: 9, agentId: 42 });
+    mockSquads();
+    mockConversationWithTurns(42);
+    useAuthStore.getState().setAccessLevel('ADMIN');
+    server.use(
+      http.post('/api/workitems/:workitemId/clarification-conversations/:conversationId/turns', () =>
+        HttpResponse.json(
+          { success: false, code: 'SEND_FAILED', message: '发送失败', traceId: null, data: null },
+          { status: 500 },
+        ),
+      ),
+    );
+    stubRangeRect();
+    renderPanel();
+    const textarea = await screen.findByPlaceholderText('输入消息...');
+    const reply = await screen.findByText('好的，请说说你的想法');
+
+    selectText(reply);
+    fireEvent.click(screen.getByRole('button', { name: '引用此内容' }));
+    await typeComposer('按这个方向继续');
+    fireEvent.keyDown(textarea, { key: 'Enter', code: 'Enter', shiftKey: true });
+
+    await waitFor(() => expect(textarea).toHaveValue('按这个方向继续'));
+    expect(screen.getByText('引用内容')).toBeInTheDocument();
+    useAuthStore.setState({ accessLevel: null });
   });
 
   it('renders backend IN and INBOUND turns as user messages', async () => {
@@ -1649,11 +1852,12 @@ describe('WorkitemClarificationPanel', () => {
       expect(clarificationInputAutoSize(32)).toBe(false);
     });
 
-    it('renders the default 6-row auto mode without a fixed height and exposes a vertical resize handle', async () => {
+    it('renders the default auto mode with the official 72px floor and exposes a vertical resize handle', async () => {
       const { composer } = await renderActiveConversation();
-      // 自动模式：不施加手动固定高度（高度由 minHeight/maxHeight 兜底，
-      // overflowY 滚动保留）
+      // 自动模式：不施加手动固定高度；官方输入壳定高下限 72px，
+      // 移动端由 CSS 变量接管（B32–B34 裁决，ResizeHandle 行数方案已废弃）。
       expect(composer.style.height).toBe('');
+      expect(composer).toHaveStyle({ minHeight: '72px' });
       const handle = screen.getByTestId('resize-handle-vertical');
       expect(handle).toHaveStyle({ cursor: 'row-resize' });
       expect(handle).toBeEmptyDOMElement();
@@ -1739,6 +1943,238 @@ describe('WorkitemClarificationPanel', () => {
       // 进入手动固定高度分支后样式仍落在同一节点上
       expect(composer).toHaveClass('aw-markdown-composer');
       expect(composer).toHaveStyle({ height: '160px' });
+    });
+  });
+
+  describe('mobile immersive reading', () => {
+    /** 输入区容器 = composer 外层（含内距与 ResizeHandle）。 */
+    function composerArea(): HTMLElement {
+      return screen.getByTestId('clarification-composer').parentElement as HTMLElement;
+    }
+
+    function headerEl(): HTMLElement {
+      return screen.getByTestId('clarification-panel-header');
+    }
+
+    /** 面板会异步自动聚焦输入框（软键盘分支）；需要验证输入区隐藏时先失焦。 */
+    function blurActiveElement() {
+      (document.activeElement as HTMLElement | null)?.blur();
+    }
+
+    it('hides the header and composer while scrolling in mobile fullscreen and restores on tap', async () => {
+      stubMobileViewport();
+      await renderActiveConversation({ fullscreen: true });
+      const scrollEl = screen.getByTestId('clarification-message-scroll');
+      mockScrollMetrics(scrollEl, 100);
+
+      blurActiveElement();
+      fireEvent.scroll(scrollEl);
+      expect(headerEl()).toHaveStyle({ display: 'none' });
+      expect(composerArea()).toHaveStyle({ display: 'none' });
+
+      // 隐藏态保持：不自动恢复
+      blurActiveElement();
+      fireEvent.scroll(scrollEl);
+      expect(headerEl()).toHaveStyle({ display: 'none' });
+
+      fireEvent.click(scrollEl);
+      expect(headerEl().style.display).not.toBe('none');
+      expect(composerArea().style.display).not.toBe('none');
+    });
+
+    it('keeps the chrome visible for desktop and docked panels', async () => {
+      // 桌面全屏
+      const { view: desktopView } = await renderActiveConversation({ fullscreen: true });
+      const desktopScroll = screen.getByTestId('clarification-message-scroll');
+      mockScrollMetrics(desktopScroll, 100);
+      fireEvent.scroll(desktopScroll);
+      expect(headerEl().style.display).not.toBe('none');
+      expect(composerArea().style.display).not.toBe('none');
+      desktopView.unmount();
+
+      // 移动端停靠
+      stubMobileViewport();
+      await renderActiveConversation();
+      const dockedScroll = screen.getByTestId('clarification-message-scroll');
+      mockScrollMetrics(dockedScroll, 100);
+      fireEvent.scroll(dockedScroll);
+      expect(headerEl().style.display).not.toBe('none');
+      expect(composerArea().style.display).not.toBe('none');
+    });
+
+    it('does not hide the chrome for programmatic scrolls that follow streaming output', async () => {
+      stubMobileViewport();
+      await renderActiveConversation({ fullscreen: true });
+      const scrollEl = screen.getByTestId('clarification-message-scroll');
+      mockScrollMetrics(scrollEl, 700);
+      const scrollToMock = vi.fn();
+      (scrollEl as unknown as { scrollTo: unknown }).scrollTo = scrollToMock;
+
+      // 流式内容到达 → 自动跟随触发程序化滚动；广播给全部订阅者，确保
+      // useClarificationEvents 的通道一定收到（单槽只留最后注册者）。
+      await waitFor(() => expect(realtime.callback).not.toBeNull());
+      act(() => {
+        const event = {
+          type: 'CONVERSATION_TURN_EVENT',
+          payload: { conversationId: 1, turnId: 2, eventSeq: 1, eventType: 'text', payload: { type: 'text', content: '流式内容' } },
+        };
+        realtime.all.forEach(cb => cb(event));
+      });
+      await waitFor(() => expect(scrollToMock).toHaveBeenCalled());
+
+      fireEvent.scroll(scrollEl);
+      expect(headerEl().style.display).not.toBe('none');
+      expect(composerArea().style.display).not.toBe('none');
+    });
+
+    it('hides only the header while the composer is focused', async () => {
+      stubMobileViewport();
+      const { composer } = await renderActiveConversation({ fullscreen: true });
+      const editor = composer.querySelector('.ProseMirror') as HTMLElement | null;
+      expect(editor).not.toBeNull();
+      editor!.focus();
+      expect(composer.contains(document.activeElement)).toBe(true);
+
+      const scrollEl = screen.getByTestId('clarification-message-scroll');
+      mockScrollMetrics(scrollEl, 100);
+      fireEvent.scroll(scrollEl);
+
+      expect(headerEl()).toHaveStyle({ display: 'none' });
+      expect(composerArea().style.display).not.toBe('none');
+      // 焦点不丢
+      expect(composer.contains(document.activeElement)).toBe(true);
+    });
+
+    it('hides only the header and keeps a pending question card while scrolling', async () => {
+      stubMobileViewport();
+      writeClarificationPrefill('100', { squadId: 9, agentId: 42 });
+      mockSquads();
+      const conversation = {
+        ...makeConversation(1, '你好，我想讨论需求'),
+        acpInteractionSupported: true,
+        pendingElicitations: [{
+          requestId: 'req-1', turnId: 10, mode: 'form', message: '请确认部署方式',
+          requestedSchema: JSON.stringify({
+            type: 'object',
+            properties: { env: { type: 'string', title: '环境' } },
+          }),
+          status: 'PENDING', gmtCreate: '2026-01-01T00:00:00',
+        }],
+      };
+      server.use(
+        http.get('/api/workitems/:workitemId/clarification-conversations', () =>
+          HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: [conversation] }),
+        ),
+        http.get('/api/workitems/:workitemId/clarification-conversations/:conversationId', () =>
+          HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: conversation }),
+        ),
+        http.get('/api/workitems/:workitemId/clarification-conversations/:conversationId/events', () =>
+          HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: [] }),
+        ),
+        // ACP 会话打开时会补一次斜杠命令探针
+        http.post('/api/workitems/:workitemId/clarification-conversations/:conversationId/commands/refresh', () =>
+          HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: null }),
+        ),
+      );
+      renderPanel({ fullscreen: true });
+
+      expect(await screen.findByTestId('elicitation-wizard-req-1')).toBeInTheDocument();
+      const scrollEl = screen.getByTestId('clarification-message-scroll');
+      mockScrollMetrics(scrollEl, 100);
+      fireEvent.scroll(scrollEl);
+
+      expect(headerEl()).toHaveStyle({ display: 'none' });
+      expect(screen.getByTestId('elicitation-wizard-req-1')).toBeVisible();
+    });
+
+    it('restores the chrome when tapping the back-to-bottom button', async () => {
+      stubMobileViewport();
+      await renderActiveConversation({ fullscreen: true });
+      const scrollEl = screen.getByTestId('clarification-message-scroll');
+      mockScrollMetrics(scrollEl, 100);
+      const scrollToMock = vi.fn();
+      (scrollEl as unknown as { scrollTo: unknown }).scrollTo = scrollToMock;
+
+      fireEvent.scroll(scrollEl);
+      expect(headerEl()).toHaveStyle({ display: 'none' });
+
+      fireEvent.click(await screen.findByLabelText('回到底部'));
+      expect(headerEl().style.display).not.toBe('none');
+      expect(composerArea().style.display).not.toBe('none');
+      expect(scrollToMock).toHaveBeenCalledWith(expect.objectContaining({ behavior: 'smooth' }));
+    });
+
+    it('keeps the chrome visible while the back-to-bottom smooth scroll is still animating', async () => {
+      stubMobileViewport();
+      await renderActiveConversation({ fullscreen: true });
+      const scrollEl = screen.getByTestId('clarification-message-scroll');
+      mockScrollMetrics(scrollEl, 100);
+      (scrollEl as unknown as { scrollTo: unknown }).scrollTo = vi.fn();
+
+      blurActiveElement();
+      fireEvent.scroll(scrollEl);
+      expect(headerEl()).toHaveStyle({ display: 'none' });
+
+      fireEvent.click(await screen.findByLabelText('回到底部'));
+      expect(headerEl().style.display).not.toBe('none');
+
+      // 平滑动画中间帧：未到底、向下滚动，不能再次隐藏
+      Object.defineProperty(scrollEl, 'scrollTop', { configurable: true, value: 400 });
+      fireEvent.scroll(scrollEl);
+      expect(headerEl().style.display).not.toBe('none');
+      expect(composerArea().style.display).not.toBe('none');
+
+      // 动画到达底部
+      Object.defineProperty(scrollEl, 'scrollTop', { configurable: true, value: 700 });
+      fireEvent.scroll(scrollEl);
+      expect(headerEl().style.display).not.toBe('none');
+      expect(composerArea().style.display).not.toBe('none');
+      // 到底后恢复跟随，回到底部按钮不再出现
+      expect(screen.queryByLabelText('回到底部')).toBeNull();
+
+      // 用户反向滚动接管后恢复正常隐藏
+      Object.defineProperty(scrollEl, 'scrollTop', { configurable: true, value: 500 });
+      blurActiveElement();
+      fireEvent.scroll(scrollEl);
+      expect(headerEl()).toHaveStyle({ display: 'none' });
+      expect(composerArea()).toHaveStyle({ display: 'none' });
+    });
+
+    it('restores the chrome after switching conversations', async () => {
+      stubMobileViewport();
+      writeClarificationPrefill('100', { squadId: 9, agentId: 42 });
+      mockSquads();
+      const latest = makeConversation(202, '最新会话消息', {
+        gmtCreate: '2026-01-02T00:00:00', lastTurnAt: '2026-01-02T01:02:03',
+      });
+      const historical = makeConversation(101, '历史会话消息', {
+        gmtCreate: '2026-01-01T00:00:00', lastTurnAt: '2026-01-01T01:02:03',
+      });
+      server.use(
+        http.get('/api/workitems/:workitemId/clarification-conversations', () =>
+          HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: [latest, historical] }),
+        ),
+        http.get('/api/workitems/:workitemId/clarification-conversations/:conversationId', ({ params }) => {
+          const conversation = [latest, historical].find((item) => item.id === Number(params.conversationId));
+          return HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: conversation });
+        }),
+      );
+      renderPanel({ fullscreen: true });
+
+      expect(await screen.findByText('最新会话消息')).toBeInTheDocument();
+      const scrollEl = screen.getByTestId('clarification-message-scroll');
+      mockScrollMetrics(scrollEl, 100);
+      fireEvent.scroll(scrollEl);
+      expect(headerEl()).toHaveStyle({ display: 'none' });
+
+      // 隐藏态下标题栏不可见，按可访问性查询会跳过它；这里只验证切换后的状态复位
+      const selector = screen.getByTestId('clarification-conversation-select');
+      fireEvent.mouseDown(within(selector).getByRole('combobox', { hidden: true }));
+      fireEvent.click(await screen.findByText(/会话 #101/));
+
+      expect(await screen.findByText('历史会话消息')).toBeInTheDocument();
+      expect(headerEl().style.display).not.toBe('none');
+      expect(composerArea().style.display).not.toBe('none');
     });
   });
 
@@ -2793,5 +3229,54 @@ describe('owned conversation fallback display', () => {
     await act(async () => { await i18n.changeLanguage('zh-CN'); });
     expect(blocks[0]).toHaveTextContent('响应已终止');
     expect(requests).toBe(count);
+  });
+});
+
+describe('clarification header workitem title', () => {
+  it('puts the workitem title right after the back button on the docked header', async () => {
+    mockSquads();
+    renderPanel({
+      workitemTitle: '支持按执行器配置平台服务地址',
+      headerPrefix: <button type="button" data-testid="stub-back">返回</button>,
+    });
+
+    const header = screen.getByTestId('clarification-panel-header');
+    const title = within(header).getByTestId('clarification-workitem-title');
+    expect(title).toHaveTextContent('支持按执行器配置平台服务地址');
+    // 超长截断，悬停看全：完整标题落在 title 属性上
+    expect(title).toHaveAttribute('title', '支持按执行器配置平台服务地址');
+    const back = within(header).getByTestId('stub-back');
+    expect(back.compareDocumentPosition(title) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    const comboboxes = await screen.findAllByRole('combobox');
+    await waitFor(() => expect(comboboxes[0]).not.toBeDisabled());
+  });
+
+  it('keeps the title on the fullscreen conversation header', async () => {
+    await renderActiveConversation({ fullscreen: true, workitemTitle: '支持按执行器配置平台服务地址' });
+
+    const header = screen.getByTestId('clarification-panel-header');
+    const title = within(header).getByTestId('clarification-workitem-title');
+    expect(title).toHaveTextContent('支持按执行器配置平台服务地址');
+    // 官方头部分两行（切换按钮在第二行），行间断言不再成立；保留能力口径为
+    // 「全屏时标题紧跟数字人名」（7c1bef95），只断首行内的相对顺序。
+    const agentName = within(header).getByText('Agent-X');
+    expect(agentName.compareDocumentPosition(title) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('renders no title slot without a title', async () => {
+    await renderActiveConversation();
+
+    expect(screen.queryByTestId('clarification-workitem-title')).toBeNull();
+  });
+
+  it('keeps a long workitem title complete for the hover tooltip while trimming its width', async () => {
+    const longTitle = '需求澄清头部超长工单标题'.repeat(10);
+    await renderActiveConversation({ workitemTitle: longTitle });
+
+    const title = screen.getByTestId('clarification-workitem-title');
+    expect(title).toHaveTextContent(longTitle);
+    expect(title).toHaveAttribute('title', longTitle);
+    expect(title).toHaveStyle({ maxWidth: '45%', whiteSpace: 'nowrap' });
   });
 });

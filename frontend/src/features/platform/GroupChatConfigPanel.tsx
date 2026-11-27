@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Button, Card, Form, Input, Switch, Tag, Tooltip, Typography, message } from 'antd';
+import { Alert, Button, Card, Form, Input, Switch, Tag, Tooltip, Typography, message } from 'antd';
 import { EyeInvisibleOutlined, EyeOutlined } from '@ant-design/icons';
 import { NoticeTip } from '@/shared/ui/NoticeTip';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -32,6 +32,25 @@ interface GroupChatFormValues {
 const FEISHU_PROVIDER = 'FEISHU';
 const DINGTALK_PROVIDER = 'DINGTALK';
 const FEISHU_DEFAULT_BASE_URL = 'https://open.feishu.cn/open-apis';
+
+const WECOM_PROVIDER = 'WECOM';
+const WECOM_CONNECTED = 'CONNECTED';
+
+const WECOM_CONNECTION_LABEL_KEYS = {
+  CONNECTING: 'wecomConnectionConnecting',
+  CONNECTED: 'wecomConnectionConnected',
+  DISCONNECTED: 'wecomConnectionDisconnected',
+  ERROR: 'wecomConnectionError',
+  UNKNOWN: 'wecomConnectionUnknown',
+} as const;
+
+const WECOM_CONNECTION_COLORS: Readonly<Record<string, string>> = {
+  CONNECTING: 'processing',
+  CONNECTED: 'green',
+  DISCONNECTED: 'default',
+  ERROR: 'red',
+  UNKNOWN: 'default',
+};
 
 type GroupChatStatusLabelKey =
   | 'groupChatStatusActive'
@@ -84,9 +103,17 @@ export function GroupChatConfigPanel({ provider, disabled = false, onBeforeSubmi
     queryKey,
     queryFn: () => getGroupChatConfig(provider),
     retry: false,
+    // 企业微信连接状态由长连接实时上报，未连接时不能显示为已连接。
+    refetchInterval: provider === WECOM_PROVIDER ? 5000 : false,
   });
   useLocalizedValidation(form, !error);
-  const providerLabel = provider === FEISHU_PROVIDER ? t('feishu') : t('dingtalk');
+  const providerLabel = provider === FEISHU_PROVIDER ? t('feishu') : provider === WECOM_PROVIDER ? t('wecom') : t('dingtalk');
+  const isWecom = provider === WECOM_PROVIDER;
+  const connection = config?.connectionStatus ?? 'UNKNOWN';
+  const connectionLabelKey = WECOM_CONNECTION_LABEL_KEYS[
+    connection as keyof typeof WECOM_CONNECTION_LABEL_KEYS
+  ];
+  const connectionLabel = connectionLabelKey ? t(connectionLabelKey) : t('wecomConnectionUnknown');
 
   useEffect(() => {
     if (draftDirty.current && seededProvider.current === provider) return;
@@ -214,6 +241,11 @@ export function GroupChatConfigPanel({ provider, disabled = false, onBeforeSubmi
             {config && <Tag color={config.desiredEnabled ? 'blue' : undefined} className={config.desiredEnabled ? undefined : 'aw-tag-gray'}>
               {config.desiredEnabled ? t('savedEnabled') : t('savedDisabled')}
             </Tag>}
+            {isWecom && (
+              <Tag color={WECOM_CONNECTION_COLORS[connection] ?? 'default'}>
+                {t('wecomConnectionLabel', { status: connectionLabel })}
+              </Tag>
+            )}
             {config && !config.configured && <Tag color="orange">{t('groupChatNotConfigured')}</Tag>}
             {config && config.drainingCount > 0 && (
               <Tag color="orange">{t('groupChatDrainingCount', { items: config.drainingCount })}</Tag>
@@ -248,6 +280,17 @@ export function GroupChatConfigPanel({ provider, disabled = false, onBeforeSubmi
 
           <NoticeTip kind="warning" title={t('groupChatWarningAlert')} />
 
+          {isWecom && (
+            <Alert
+              type={connection === WECOM_CONNECTED && config?.ready ? 'success' : 'warning'}
+              showIcon
+              message={t('wecomConnectionSeparate')}
+              description={connection === WECOM_CONNECTED
+                ? config?.ready ? t('wecomReadyHint') : t('wecomNotReadyConfig')
+                : t('wecomNotReadyConnection', { status: connectionLabel })}
+            />
+          )}
+
           <Form
             form={form}
             name="groupChatConfig"
@@ -277,18 +320,22 @@ export function GroupChatConfigPanel({ provider, disabled = false, onBeforeSubmi
             </div>
             <div className="aw-platform-message-fields">
               <Form.Item
-                label={provider === FEISHU_PROVIDER ? t('groupChatAppIdLabel') : t('groupChatAppKeyLabel')}
+                label={provider === FEISHU_PROVIDER
+                  ? t('groupChatAppIdLabel')
+                  : isWecom ? t('groupChatWecomBotIdLabel') : t('groupChatAppKeyLabel')}
                 name="appKey"
                 validateTrigger={[]}
                 extra={config?.configured ? t('groupChatIdentityEditable') : undefined}
                 rules={[({ getFieldValue }) => ({
                   validator: (_, value) => !getFieldValue('enabled') || value
                     ? Promise.resolve()
-                    : Promise.reject(new Error(t('appKeyRequired'))),
+                    : Promise.reject(new Error(isWecom ? t('wecomBotIdRequired') : t('appKeyRequired'))),
                 })]}
               >
                 <Input
-                  placeholder={provider === FEISHU_PROVIDER ? t('appIdPlaceholder') : t('appKeyPlaceholder')}
+                  placeholder={provider === FEISHU_PROVIDER
+                    ? t('appIdPlaceholder')
+                    : isWecom ? t('wecomBotIdPlaceholder') : t('appKeyPlaceholder')}
                 />
               </Form.Item>
               {provider === DINGTALK_PROVIDER && (
@@ -307,7 +354,7 @@ export function GroupChatConfigPanel({ provider, disabled = false, onBeforeSubmi
                 </Form.Item>
               )}
               <Form.Item
-                label={t('groupChatAppSecretLabel')}
+                label={isWecom ? t('groupChatWecomSecretLabel') : t('groupChatAppSecretLabel')}
                 name="appSecret"
                 validateTrigger={[]}
                 extra={applicationChanged
@@ -321,7 +368,7 @@ export function GroupChatConfigPanel({ provider, disabled = false, onBeforeSubmi
                     const changed = appKeyDiffers({ appKey: getFieldValue('appKey') });
                     return value || (!changed && draftConfig.current?.secretConfigured)
                       ? Promise.resolve()
-                      : Promise.reject(new Error(t('appSecretRequired')));
+                      : Promise.reject(new Error(isWecom ? t('wecomSecretRequired') : t('appSecretRequired')));
                   },
                 })]}
               >

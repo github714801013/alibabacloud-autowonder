@@ -11,6 +11,8 @@ import '../clarification.css';
 export interface ElicitationReply {
   action: 'accept' | 'decline';
   content?: Record<string, unknown>;
+  /** 与结构化内容同时生成的文本答案，结构化提交因卡片过期被 409 拒绝时改用它发送。 */
+  text?: string;
 }
 
 interface ElicitationCardProps {

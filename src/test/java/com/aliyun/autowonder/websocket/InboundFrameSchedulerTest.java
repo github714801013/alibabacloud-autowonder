@@ -154,4 +154,139 @@ class InboundFrameSchedulerTest {
         heartbeats.remove().run();
         assertEquals(List.of("progress", "ack", "heartbeat", "next-heartbeat"), completed);
     }
+
+    @Test
+    void boundsPerDispatchBacklogWithoutClosingOtherExecutors() throws Exception {
+        var registry = mock(SessionRegistry.class);
+        when(registry.isCurrent(any())).thenReturn(true);
+        var tasks = new ArrayDeque<Runnable>();
+        var scheduler = new InboundFrameScheduler(registry, tasks::add, tasks::add, tasks::add, 10, 1);
+        // 一个执行器会话承载多个 dispatch，拒绝粒度为整条会话，因此只会影响同一执行器。
+        var busy = session(100, 1, "busy");
+        var other = session(100, 2, "other");
+        scheduler.dispatch(busy, 55, "TASK_RESULT", () -> { });
+        scheduler.dispatch(busy, 55, "TASK_RESULT", () -> fail("critical backlog must be bounded"));
+        verify(busy.getSession()).close(argThat(reason -> reason.getCloseCode().getCode() == 1013));
+        scheduler.dispatch(other, 56, "TASK_PROGRESS", () -> { });
+        verify(other.getSession(), never()).close(any(CloseReason.class));
+    }
+
+    @Test
+    void queuedProgressKeepsOnlyTheLatestWithoutClosingSession() throws Exception {
+        var registry = mock(SessionRegistry.class);
+        when(registry.isCurrent(any())).thenReturn(true);
+        var tasks = new ArrayDeque<Runnable>();
+        var scheduler = new InboundFrameScheduler(registry, tasks::add, tasks::add, tasks::add, 10, 2);
+        var session = session(100, 1, "busy");
+        var completed = new ArrayList<String>();
+        scheduler.dispatch(session, 55, "TASK_PROGRESS", () -> completed.add("first"));
+        scheduler.dispatch(session, 55, "TASK_PROGRESS", () -> completed.add("stale"));
+        scheduler.dispatch(session, 55, "TASK_PROGRESS", () -> completed.add("latest"));
+        verify(session.getSession(), never()).close(any(CloseReason.class));
+        while (!tasks.isEmpty()) tasks.remove().run();
+        assertEquals(List.of("first", "latest"), completed);
+    }
+
+    @Test
+    void progressOverflowDropsIncomingFrameInsteadOfClosingSession() throws Exception {
+        var registry = mock(SessionRegistry.class);
+        when(registry.isCurrent(any())).thenReturn(true);
+        var tasks = new ArrayDeque<Runnable>();
+        var scheduler = new InboundFrameScheduler(registry, tasks::add, tasks::add, tasks::add, 10, 1);
+        var session = session(100, 1, "busy");
+        var completed = new ArrayList<String>();
+        scheduler.dispatch(session, 55, "TASK_PROGRESS", () -> completed.add("first"));
+        scheduler.dispatch(session, 55, "TASK_PROGRESS", () -> completed.add("dropped"));
+        verify(session.getSession(), never()).close(any(CloseReason.class));
+        while (!tasks.isEmpty()) tasks.remove().run();
+        assertEquals(List.of("first"), completed);
+    }
+
+    @Test
+    void progressMergeKeepsQueuedCriticalFramesInOrder() throws Exception {
+        var registry = mock(SessionRegistry.class);
+        when(registry.isCurrent(any())).thenReturn(true);
+        var tasks = new ArrayDeque<Runnable>();
+        var scheduler = new InboundFrameScheduler(registry, tasks::add, tasks::add, tasks::add, 10, 3);
+        var session = session(100, 1, "busy");
+        var completed = new ArrayList<String>();
+        scheduler.dispatch(session, 55, "TASK_PROGRESS", () -> completed.add("p1"));
+        scheduler.dispatch(session, 55, "TASK_ACK", () -> completed.add("ack"));
+        scheduler.dispatch(session, 55, "TASK_PROGRESS", () -> completed.add("p2"));
+        scheduler.dispatch(session, 55, "TASK_PROGRESS", () -> completed.add("p3"));
+        verify(session.getSession(), never()).close(any(CloseReason.class));
+        while (!tasks.isEmpty()) tasks.remove().run();
+        assertEquals(List.of("p1", "ack", "p3"), completed);
+    }
+
+    @Test
+    void perDispatchLimitDoesNotApplyToHeartbeatLane() throws Exception {
+        var registry = mock(SessionRegistry.class);
+        when(registry.isCurrent(any())).thenReturn(true);
+        var tasks = new ArrayDeque<Runnable>();
+        var scheduler = new InboundFrameScheduler(registry, tasks::add, tasks::add, tasks::add, 10, 1);
+        var session = session(100, 1, "busy");
+        var completed = new ArrayList<String>();
+        scheduler.dispatch(session, 55, "TASK_PROGRESS", () -> completed.add("progress"));
+        scheduler.heartbeat(session, () -> completed.add("heartbeat"));
+        verify(session.getSession(), never()).close(any(CloseReason.class));
+        while (!tasks.isEmpty()) tasks.remove().run();
+        assertEquals(List.of("progress", "heartbeat"), completed);
+    }
+
+    @Test
+    void conversationFramesRunInArrivalOrderPerTurn() throws Exception {
+        var registry = mock(SessionRegistry.class);
+        when(registry.isCurrent(any())).thenReturn(true);
+        var tasks = new ArrayDeque<Runnable>();
+        var scheduler = new InboundFrameScheduler(registry, tasks::add, tasks::add, tasks::add, 8);
+        var session = session(100, 1, "busy");
+        var completed = new ArrayList<String>();
+        scheduler.dispatchConversation(session, 55, "CONVERSATION_TURN_EVENT", () -> completed.add("event-1"));
+        scheduler.dispatchConversation(session, 55, "CONVERSATION_TURN_ACK", () -> completed.add("ack"));
+        scheduler.dispatchConversation(session, 55, "CONVERSATION_TURN_EVENT", () -> completed.add("event-2"));
+        verify(session.getSession(), never()).close(any(CloseReason.class));
+        while (!tasks.isEmpty()) tasks.remove().run();
+        assertEquals(List.of("event-1", "ack", "event-2"), completed);
+    }
+
+    @Test
+    void conversationFramesUseTheirOwnLaneInsteadOfDispatchControls() {
+        var registry = mock(SessionRegistry.class);
+        when(registry.isCurrent(any())).thenReturn(true);
+        var controls = new ArrayDeque<Runnable>();
+        var conversations = new ArrayDeque<Runnable>();
+        var scheduler = new InboundFrameScheduler(registry, controls::add, controls::add, controls::add,
+                conversations::add, 8, 8, 8, 8);
+        var session = session(100, 1, "busy");
+        scheduler.dispatchConversation(session, 55, "CONVERSATION_TURN_EVENT", () -> { });
+        scheduler.dispatch(session, 56, "TASK_ACK", () -> { });
+        assertEquals(1, conversations.size());
+        assertEquals(1, controls.size());
+    }
+
+    @Test
+    void conversationPerTurnOverflowClosesSessionForReplay() throws Exception {
+        var registry = mock(SessionRegistry.class);
+        when(registry.isCurrent(any())).thenReturn(true);
+        var tasks = new ArrayDeque<Runnable>();
+        var scheduler = new InboundFrameScheduler(registry, tasks::add, tasks::add, tasks::add, 8, 8, 8, 1);
+        var session = session(100, 1, "busy");
+        scheduler.dispatchConversation(session, 55, "CONVERSATION_TURN_EVENT", () -> {});
+        scheduler.dispatchConversation(session, 55, "CONVERSATION_TURN_EVENT", () -> {});
+        verify(session.getSession()).close(argThat(reason -> reason.getCloseCode().getCode() == 1013));
+    }
+
+    @Test
+    void conversationGlobalOverflowClosesSessionForReplay() throws Exception {
+        var registry = mock(SessionRegistry.class);
+        when(registry.isCurrent(any())).thenReturn(true);
+        var tasks = new ArrayDeque<Runnable>();
+        var scheduler = new InboundFrameScheduler(registry, tasks::add, tasks::add, tasks::add, 8, 8, 2, 8);
+        var session = session(100, 1, "busy");
+        scheduler.dispatchConversation(session, 55, "CONVERSATION_TURN_EVENT", () -> {});
+        scheduler.dispatchConversation(session, 56, "CONVERSATION_TURN_EVENT", () -> {});
+        scheduler.dispatchConversation(session, 57, "CONVERSATION_TURN_EVENT", () -> {});
+        verify(session.getSession()).close(argThat(reason -> reason.getCloseCode().getCode() == 1013));
+    }
 }

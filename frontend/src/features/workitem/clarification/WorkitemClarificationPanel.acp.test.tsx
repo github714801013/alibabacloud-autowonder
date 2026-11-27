@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { useEffect, useRef } from 'react';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { message } from 'antd';
 import { typeComposer } from './composerTestUtils';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { http, HttpResponse } from 'msw';
@@ -288,6 +289,39 @@ describe('WorkitemClarificationPanel ACP 交互接线', () => {
     await waitFor(() => expect(detailCalls).toBeGreaterThan(callsBeforeReply));
   });
 
+  // 线上重复提交：提交成功但卡片要等 resolved 回声才撤下，期间按钮若恢复可点，
+  // 用户会以为没提交成功再点一次，产生第二个相同 POST。
+  it('提交成功后立即撤下卡片，不再等 resolved 回声', async () => {
+    let replyCalls = 0;
+    await renderPanel({
+      acpInteractionSupported: true,
+      processingStatus: 'PROCESSING',
+      processingTurnId: 3,
+      pendingElicitations: [{
+        requestId: 'req-1', turnId: 3, mode: 'form', message: '选一个',
+        requestedSchema: SELECT_SCHEMA, status: 'PENDING', gmtCreate: '',
+      }],
+      turns: [{ id: 3, direction: 'INBOUND', content: '请给方案', status: 'PROCESSING' }],
+    });
+    server.use(
+      http.post(
+        '/api/workitems/:workitemId/clarification-conversations/:conversationId/elicitations/:requestId/reply',
+        () => {
+          replyCalls += 1;
+          return ok(null);
+        },
+      ),
+    );
+
+    await screen.findByTestId('elicitation-wizard-req-1');
+    fireEvent.click(screen.getByTestId('elicitation-option-q0-0'));
+    fireEvent.click(screen.getByTestId('elicitation-submit-req-1'));
+
+    await waitFor(() => expect(replyCalls).toBe(1));
+    // 详情接口仍返回旧的 pending 数据（回声未到），但服务端已结算，卡片必须立即撤下
+    await waitFor(() => expect(screen.queryByTestId('elicitation-wizard-req-1')).toBeNull());
+  });
+
   // F14：跳过 = decline，Qoder 收到后 end_turn 正常收尾。
   it('declines the card when the user skips it', async () => {
     let replyBody: unknown = null;
@@ -372,6 +406,38 @@ describe('WorkitemClarificationPanel ACP 交互接线', () => {
     expect(screen.getByTestId('elicitation-wizard-req-1')).toBeInTheDocument();
   });
 
+  // 业务失败（如回答权限被拒）必须原样展示后端文案，不能被通用文案吞掉。
+  it('shows the backend message for a business reply failure', async () => {
+    await renderPanel({
+      acpInteractionSupported: true,
+      processingStatus: 'PROCESSING',
+      processingTurnId: 3,
+      pendingElicitations: [{
+        requestId: 'req-1', turnId: 3, mode: 'form', message: '选一个',
+        requestedSchema: SELECT_SCHEMA, status: 'PENDING', gmtCreate: '',
+      }],
+      turns: [{ id: 3, direction: 'INBOUND', content: '请给方案', status: 'PROCESSING' }],
+    });
+    server.use(
+      http.post(
+        '/api/workitems/:workitemId/clarification-conversations/:conversationId/elicitations/:requestId/reply',
+        () => HttpResponse.json(
+          {
+            success: false, code: '10403',
+            message: '只有原消息发送者或当前工单负责人可以回答这个问题。',
+            traceId: null, data: null,
+          },
+          { status: 403 },
+        ),
+      ),
+    );
+
+    fireEvent.click(await screen.findByTestId('elicitation-skip-req-1'));
+
+    expect(await screen.findByText('只有原消息发送者或当前工单负责人可以回答这个问题。')).toBeInTheDocument();
+    expect(screen.getByTestId('elicitation-skip-req-1')).toBeEnabled();
+  });
+
   // 线上 bug：轮次取消把卡片结算成 CANCELED，但该 resolved 事件不落库，前端时间线仍当作 pending，
   // 提交/跳过都吃 409「already settled」，卡片关不掉、对话卡死。修复：CONFLICT 即撤下卡片。
   it('对已结算（409 CONFLICT）的问题：撤下卡片并提示已失效，解除卡死', async () => {
@@ -404,7 +470,8 @@ describe('WorkitemClarificationPanel ACP 交互接线', () => {
   });
 
   // 复现线上真实路径：卡片来自流式时间线节点（非 restored），且走提交（accept）路径吃 409。
-  it('流式时间线里的 pending 卡片提交 409 后也撤下', async () => {
+  it('流式时间线里的 pending 卡片提交 409 后改发文本并撤下卡片', async () => {
+    let sends = 0;
     await renderPanel({
       acpInteractionSupported: true,
       processingStatus: 'PROCESSING',
@@ -421,16 +488,25 @@ describe('WorkitemClarificationPanel ACP 交互接线', () => {
       http.post(
         '/api/workitems/:workitemId/clarification-conversations/:conversationId/elicitations/:requestId/reply',
         () => HttpResponse.json(
-          { success: false, code: '10409', message: 'elicitation already settled: CANCELED', traceId: null, data: null },
+          { success: false, code: '10409', message: 'elicitation turn is no longer processing', traceId: null, data: null },
           { status: 409 },
         ),
       ),
+      http.post(
+        '/api/workitems/:workitemId/clarification-conversations/:conversationId/turns',
+        () => { sends++; return ok(null); },
+      ),
     );
 
+    // 上一个用例的 antd 全局提示不随组件卸载消失，先清掉再断言本次没有新的失效提示。
+    message.destroy();
+    await waitFor(() => expect(screen.queryByText('该问题已失效，已为你关闭')).not.toBeInTheDocument());
     fireEvent.click(screen.getByTestId('elicitation-option-q0-0'));
     fireEvent.click(screen.getByTestId('elicitation-submit-req-s'));
 
-    expect(await screen.findByText('该问题已失效，已为你关闭')).toBeInTheDocument();
+    // 结构化提交已被拒：同一份选择改走普通消息，不再显示「该问题已失效」。
+    await waitFor(() => expect(sends).toBe(1));
+    expect(screen.queryByText('该问题已失效，已为你关闭')).not.toBeInTheDocument();
     await waitFor(() => expect(screen.queryByTestId('elicitation-wizard-req-s')).toBeNull());
   });
 
@@ -1108,10 +1184,16 @@ describe('durable clarification history', () => {
     await renderPanel(conv);
     for (const card of cards) expect(await screen.findAllByText(JSON.parse(card.answerJson).q0)).toHaveLength(1);
   });
-  it('links uncertain delivery to its preserved answer and restores expired context only into the draft', async () => {
-    let sends = 0; let replies = 0;
-    server.use(http.post('/api/workitems/:workitemId/clarification-conversations/:conversationId/turns', () => { sends++; return ok(null); }),
-      http.post('/api/workitems/:workitemId/clarification-conversations/:conversationId/elicitations/:requestId/reply', () => { replies++; return ok(null); }));
+  it('links uncertain delivery to its preserved answer and opens the expired question in the composer editor', async () => {
+    let sends = 0; let replies = 0; let sentContent = '';
+    server.use(
+      http.post('/api/workitems/:workitemId/clarification-conversations/:conversationId/turns', async ({ request }) => {
+        sends++;
+        sentContent = (await request.json() as { content: string }).content;
+        return ok(null);
+      }),
+      http.post('/api/workitems/:workitemId/clarification-conversations/:conversationId/elicitations/:requestId/reply', () => { replies++; return ok(null); }),
+    );
     const uncertain = { ...rows(1, 3)[0], deliveryStatus: 'UNKNOWN' };
     const expired = { ...rows(1, 5)[0], status: 'EXPIRED', deliveryStatus: null, answerJson: null };
     await renderPanel({ acpInteractionSupported: true, questionHistory: [uncertain, expired],
@@ -1124,16 +1206,67 @@ describe('durable clarification history', () => {
     expect(history).toHaveTextContent('回答的处理状态无法确认，已保留答案，请查看本轮结果');
     await typeComposer('Keep my draft');
     fireEvent.click(screen.getByRole('button', { name: '继续回答' }));
-    fireEvent.click(screen.getByRole('button', { name: '继续回答' }));
-    const input = screen.getByPlaceholderText('输入消息...') as HTMLTextAreaElement;
-    expect(input.value).toContain('Keep my draft');
-    expect(input.value).toContain('Original request for fresh session');
-    expect(input.value).toContain('Question 5/0');
-    expect(input.value).toContain('首选技术栈');
-    expect(input.value.match(/Original request for fresh session/g)).toHaveLength(1);
+    // 「继续回答」不再往草稿里拼上下文：在输入框位置打开可编辑卡片，历史卡片保留 EXPIRED 标记。
+    expect(screen.queryByPlaceholderText('输入消息...')).toBeNull();
+    expect(screen.getByTestId('elicitation-wizard-q-5-0')).toBeInTheDocument();
+    expect(screen.getByTestId('question-history-5-q-5-0')).toHaveTextContent('因长时间未回答而结束');
     expect(sends).toBe(0); expect(replies).toBe(0);
-    fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+
+    fireEvent.click(screen.getByTestId('elicitation-option-q0-0'));
+    fireEvent.click(screen.getByTestId('elicitation-submit-q-5-0'));
     await waitFor(() => expect(sends).toBe(1));
+    expect(sentContent).toBe('首选技术栈：Next.js 全栈');
+    expect(replies).toBe(0);
+    expect((screen.getByPlaceholderText('输入消息...') as HTMLTextAreaElement).value).toBe('Keep my draft');
+  });
+  it('opens a system-canceled question in the composer editor and replies as text', async () => {
+    let sends = 0; let replies = 0; let sentContent = '';
+    server.use(
+      http.post('/api/workitems/:workitemId/clarification-conversations/:conversationId/turns', async ({ request }) => {
+        sends++;
+        sentContent = (await request.json() as { content: string }).content;
+        return ok(null);
+      }),
+      http.post('/api/workitems/:workitemId/clarification-conversations/:conversationId/elicitations/:requestId/reply', () => { replies++; return ok(null); }),
+    );
+    const canceled = { ...rows(1, 7)[0], status: 'CANCELED', deliveryStatus: null, answerJson: null };
+    await renderPanel({ acpInteractionSupported: true, questionHistory: [canceled],
+      turns: [{ id: 7, direction: 'IN', content: 'Original request', status: 'SUCCESS' }] });
+    const history = await screen.findByTestId('question-history-7-q-7-0');
+    expect(history).toHaveTextContent('已取消');
+
+    fireEvent.click(await screen.findByRole('button', { name: '继续回答' }));
+    expect(screen.getByTestId('elicitation-wizard-q-7-0')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('elicitation-option-q0-0'));
+    fireEvent.click(screen.getByTestId('elicitation-submit-q-7-0'));
+    await waitFor(() => expect(sends).toBe(1));
+    expect(sentContent).toBe('首选技术栈：Next.js 全栈');
+    expect(replies).toBe(0);
+  });
+  it('opens a user-declined question in the composer editor and replies as text', async () => {
+    let sends = 0; let replies = 0; let sentContent = '';
+    server.use(
+      http.post('/api/workitems/:workitemId/clarification-conversations/:conversationId/turns', async ({ request }) => {
+        sends++;
+        sentContent = (await request.json() as { content: string }).content;
+        return ok(null);
+      }),
+      http.post('/api/workitems/:workitemId/clarification-conversations/:conversationId/elicitations/:requestId/reply', () => { replies++; return ok(null); }),
+    );
+    const declined = { ...rows(1, 8)[0], status: 'DECLINED', deliveryStatus: null, answerJson: null };
+    await renderPanel({ acpInteractionSupported: true, questionHistory: [declined],
+      turns: [{ id: 8, direction: 'IN', content: 'Original request', status: 'SUCCESS' }] });
+    const history = await screen.findByTestId('question-history-8-q-8-0');
+    expect(history).toHaveTextContent('已跳过');
+
+    fireEvent.click(await screen.findByRole('button', { name: '继续回答' }));
+    expect(screen.getByTestId('elicitation-wizard-q-8-0')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('elicitation-option-q0-0'));
+    fireEvent.click(screen.getByTestId('elicitation-submit-q-8-0'));
+    await waitFor(() => expect(sends).toBe(1));
+    expect(sentContent).toBe('首选技术栈：Next.js 全栈');
     expect(replies).toBe(0);
   });
 });
@@ -1152,4 +1285,130 @@ it('keeps expired draft restoration disabled during processing and for read-only
   refetchConversation(queryClient);
   await waitFor(() => expect(button).toBeDisabled());
   view.unmount(); queryClient.clear(); useAuthStore.getState().clear(); clearClarificationPrefill('100'); realtime.callback = null;
+});
+
+describe('超时答题卡的保留与文本回复', () => {
+  beforeEach(() => useAuthStore.getState().setCurrentWorkspace({ id: 1, name: 'Test', description: '' }, 'ADMIN'));
+  afterEach(() => {
+    clearClarificationPrefill('100');
+    realtime.callback = null;
+    vi.restoreAllMocks();
+    useAuthStore.getState().clear();
+  });
+
+  it('超时后卡片保留可改选，提交时把已选项作为普通消息发送', async () => {
+    let sentContent = '';
+    await renderPanel({ acpInteractionSupported: true });
+    await screen.findByPlaceholderText('输入消息...');
+    emit(1, 'acp_elicitation', {
+      type: 'acp_elicitation',
+      data: { requestId: 'req-late', mode: 'form', message: '选一个', requestedSchema: JSON.parse(SELECT_SCHEMA) },
+    });
+    await screen.findByTestId('elicitation-wizard-req-late');
+    server.use(http.post(
+      '/api/workitems/:workitemId/clarification-conversations/:conversationId/turns',
+      async ({ request }) => {
+        sentContent = (await request.json() as { content: string }).content;
+        return ok(null);
+      },
+    ));
+
+    emit(2, 'acp_elicitation_resolved', {
+      type: 'acp_elicitation_resolved',
+      data: { requestId: 'req-late', action: 'cancel', status: 'EXPIRED' },
+    });
+
+    // 超时结算不淡出、不卸载，也不出现「已超时」标记；输入框继续由卡片占位。
+    expect(screen.getByTestId('elicitation-wizard-req-late')).not.toHaveClass('is-dismissing');
+    expect(screen.queryByText('因长时间未回答而结束')).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText('输入消息...')).toBeNull();
+    expect(screen.queryByTestId('question-history-3-req-late')).toBeNull();
+
+    fireEvent.click(screen.getByTestId('elicitation-option-q0-1'));
+    fireEvent.click(screen.getByTestId('elicitation-submit-req-late'));
+    await waitFor(() => expect(sentContent).toBe('首选技术栈：Vite + Spring'));
+    await waitFor(() => expect(screen.queryByTestId('elicitation-wizard-req-late')).toBeNull());
+    expect(await screen.findByPlaceholderText('输入消息...')).toBeInTheDocument();
+  });
+
+  it('超时后跳过：只关闭卡片，不发送消息', async () => {
+    let sends = 0;
+    await renderPanel({ acpInteractionSupported: true });
+    await screen.findByPlaceholderText('输入消息...');
+    emit(1, 'acp_elicitation', {
+      type: 'acp_elicitation',
+      data: { requestId: 'req-skip', mode: 'form', message: '选一个', requestedSchema: JSON.parse(SELECT_SCHEMA) },
+    });
+    await screen.findByTestId('elicitation-wizard-req-skip');
+    server.use(http.post(
+      '/api/workitems/:workitemId/clarification-conversations/:conversationId/turns',
+      () => { sends++; return ok(null); },
+    ));
+
+    emit(2, 'acp_elicitation_resolved', {
+      type: 'acp_elicitation_resolved',
+      data: { requestId: 'req-skip', action: 'cancel', status: 'EXPIRED' },
+    });
+    fireEvent.click(screen.getByTestId('elicitation-skip-req-skip'));
+
+    await waitFor(() => expect(screen.queryByTestId('elicitation-wizard-req-skip')).toBeNull());
+    expect(sends).toBe(0);
+  });
+
+  it('文本发送失败时保留超时卡片与已选项，并提示重试', async () => {
+    await renderPanel({ acpInteractionSupported: true });
+    await screen.findByPlaceholderText('输入消息...');
+    emit(1, 'acp_elicitation', {
+      type: 'acp_elicitation',
+      data: { requestId: 'req-fail', mode: 'form', message: '选一个', requestedSchema: JSON.parse(SELECT_SCHEMA) },
+    });
+    await screen.findByTestId('elicitation-wizard-req-fail');
+    server.use(http.post(
+      '/api/workitems/:workitemId/clarification-conversations/:conversationId/turns',
+      () => HttpResponse.json(
+        { success: false, code: '10000', message: '服务暂时不可用', traceId: null, data: null },
+        { status: 500 },
+      ),
+    ));
+
+    emit(2, 'acp_elicitation_resolved', {
+      type: 'acp_elicitation_resolved',
+      data: { requestId: 'req-fail', action: 'cancel', status: 'EXPIRED' },
+    });
+    fireEvent.click(screen.getByTestId('elicitation-option-q0-1'));
+    fireEvent.click(screen.getByTestId('elicitation-submit-req-fail'));
+
+    expect(await screen.findByText('消息发送失败，请重试')).toBeInTheDocument();
+    expect(screen.getByTestId('elicitation-wizard-req-fail')).toBeInTheDocument();
+    expect(screen.getByTestId('elicitation-option-q0-1')).toBeChecked();
+    expect(screen.getByTestId('elicitation-submit-req-fail')).toBeEnabled();
+  });
+
+  it('只读用户不能提交超时卡片：按钮禁用、展示只读提示且不发消息', async () => {
+    useAuthStore.getState().setCurrentWorkspace({ id: 1, name: 'Test', description: '' }, 'READ_ONLY');
+    let sends = 0;
+    await renderPanel({ acpInteractionSupported: true });
+    await screen.findByPlaceholderText('输入消息...');
+    emit(1, 'acp_elicitation', {
+      type: 'acp_elicitation',
+      data: { requestId: 'req-readonly', mode: 'form', message: '选一个', requestedSchema: JSON.parse(SELECT_SCHEMA) },
+    });
+    await screen.findByTestId('elicitation-wizard-req-readonly');
+    server.use(http.post(
+      '/api/workitems/:workitemId/clarification-conversations/:conversationId/turns',
+      () => { sends++; return ok(null); },
+    ));
+
+    emit(2, 'acp_elicitation_resolved', {
+      type: 'acp_elicitation_resolved',
+      data: { requestId: 'req-readonly', action: 'cancel', status: 'EXPIRED' },
+    });
+    fireEvent.click(screen.getByTestId('elicitation-option-q0-1'));
+    expect(screen.getByTestId('elicitation-submit-req-readonly')).toBeDisabled();
+    expect(screen.getByTestId('elicitation-readonly-req-readonly'))
+      .toHaveTextContent('有工作空间写权限的成员可以回答。');
+    fireEvent.click(screen.getByTestId('elicitation-submit-req-readonly'));
+    expect(sends).toBe(0);
+    expect(screen.getByTestId('elicitation-wizard-req-readonly')).toBeInTheDocument();
+  });
 });

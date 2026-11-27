@@ -5,7 +5,7 @@ import { PageBackButton } from '@/shared/ui/PageBackButton';
 import { PageHead } from '@/shared/ui/PageHead';
 import { PlatformShell } from '@/shared/ui/PlatformShell';
 import { useEffect, useRef, useState } from 'react';
-import { Button, Card, Form, Input, Modal, Radio, Switch, Tabs, Tag, Typography, Upload, message, type InputProps } from 'antd';
+import { Alert, Button, Card, Form, Input, Modal, Radio, Switch, Tabs, Tag, Typography, Upload, message, type InputProps } from 'antd';
 import { EyeOutlined, EyeInvisibleOutlined } from '@ant-design/icons';
 import { AwStrokeIcon } from '@/shared/ui/AwStrokeIcon';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -25,6 +25,7 @@ import {
   selectedImProvider,
   updateDingTalkImChannel,
   updateFeishuImChannel,
+  updateWecomImChannel,
   updateBranding,
   uploadBrandingLogo,
   type PlatformImChannel,
@@ -128,6 +129,31 @@ const EMPTY_IM_CHANNEL: PlatformImChannel = {
 const FEISHU_DEFAULT_BASE_URL = 'https://open.feishu.cn/open-apis';
 const FEISHU_PROVIDER = 'FEISHU';
 
+const PROVIDER_ORDER = ['DINGTALK', 'FEISHU', 'WECOM'] as const;
+const PROVIDER_LABEL_KEYS = {
+  DINGTALK: 'dingtalk',
+  FEISHU: 'feishu',
+  WECOM: 'wecom',
+} as const;
+
+const WECOM_CONNECTED = 'CONNECTED';
+
+const WECOM_CONNECTION_LABEL_KEYS = {
+  CONNECTING: 'wecomConnectionConnecting',
+  CONNECTED: 'wecomConnectionConnected',
+  DISCONNECTED: 'wecomConnectionDisconnected',
+  ERROR: 'wecomConnectionError',
+  UNKNOWN: 'wecomConnectionUnknown',
+} as const;
+
+const WECOM_CONNECTION_COLORS: Readonly<Record<string, string>> = {
+  CONNECTING: 'processing',
+  CONNECTED: 'green',
+  DISCONNECTED: 'default',
+  ERROR: 'red',
+  UNKNOWN: 'default',
+};
+
 export function BrandingConfigPage() {
   const { t } = useTranslation('platform');
   const [form] = Form.useForm<UpdatePlatformBrandingParams>();
@@ -139,6 +165,12 @@ export function BrandingConfigPage() {
     retry: false,
   });
   const isPlatformAdmin = data?.canManage === true;
+  const { data: imSelection, error: selectionError, refetch: refetchSelection } = useQuery({
+    queryKey: IM_SELECTION_QUERY_KEY,
+    queryFn: getImSelection,
+    enabled: isPlatformAdmin,
+    retry: false,
+  });
   const {
     data: imChannels,
     error: imChannelsError,
@@ -149,12 +181,8 @@ export function BrandingConfigPage() {
     queryFn: getPlatformImChannels,
     enabled: isPlatformAdmin,
     retry: false,
-  });
-  const { data: imSelection, error: selectionError, refetch: refetchSelection } = useQuery({
-    queryKey: IM_SELECTION_QUERY_KEY,
-    queryFn: getImSelection,
-    enabled: isPlatformAdmin,
-    retry: false,
+    // 企业微信连接状态由长连接实时上报，仅在选中该渠道时轮询。
+    refetchInterval: imSelection?.provider === 'WECOM' ? 5000 : false,
   });
 
   const [activeTab, setActiveTab] = useState(readPlatformConfigTab);
@@ -184,8 +212,12 @@ export function BrandingConfigPage() {
   useLocalizedValidation(form, !error && resolvedActiveTab === BRANDING_TAB_KEY);
   useLocalizedValidation(imForm, isPlatformAdmin && !error && !imChannelsError && !selectionError);
   const provider = imSelection?.provider ?? (imChannels ? selectedImProvider(imChannels) : 'DINGTALK');
-  const selectionKnown = !selectionError && (provider === FEISHU_PROVIDER || provider === 'DINGTALK');
-  const providerLabel = selectionKnown ? provider === FEISHU_PROVIDER ? t('feishu') : t('dingtalk') : t('groupChatStatusUnknown');
+  const providerLabelOf = (value: string) => {
+    const key = PROVIDER_LABEL_KEYS[value as keyof typeof PROVIDER_LABEL_KEYS];
+    return key ? t(key) : value;
+  };
+  const selectionKnown = !selectionError && (provider === FEISHU_PROVIDER || provider === 'DINGTALK' || provider === 'WECOM');
+  const providerLabel = selectionKnown ? providerLabelOf(provider) : t('groupChatStatusUnknown');
   const messageWritesAvailable = isPlatformAdmin && selectionKnown && imChannels != null && !imChannelsError;
   const messageWritesAvailableRef = useRef(messageWritesAvailable);
   messageWritesAvailableRef.current = messageWritesAvailable;
@@ -202,6 +234,28 @@ export function BrandingConfigPage() {
   // Keep a supported themeKey in the payload, but never highlight a preset for a different color.
   const selectedTheme = THEME_PRESETS.find((theme) =>
     theme.key === themeKey && theme.primaryColor.toLowerCase() === primaryColor.toLowerCase())?.key;
+  const isWecom = provider === 'WECOM';
+  const wecomConnection = imChannel.connectionStatus ?? 'UNKNOWN';
+  const wecomConnectionLabelKey = WECOM_CONNECTION_LABEL_KEYS[
+    wecomConnection as keyof typeof WECOM_CONNECTION_LABEL_KEYS
+  ];
+  const wecomConnectionLabel = wecomConnectionLabelKey ? t(wecomConnectionLabelKey) : t('wecomConnectionUnknown');
+  const wecomReadinessReasons: string[] = [];
+  if (isWecom) {
+    if (!imChannel.enabled) wecomReadinessReasons.push(t('wecomNotReadyDisabled'));
+    if (!imChannel.secretConfigured) wecomReadinessReasons.push(t('wecomNotReadySecret'));
+    if (!imReady && imChannel.enabled && imChannel.secretConfigured) {
+      wecomReadinessReasons.push(t('wecomNotReadyConfig'));
+    }
+    if (wecomConnection !== WECOM_CONNECTED) {
+      wecomReadinessReasons.push(t('wecomNotReadyConnection', { status: wecomConnectionLabel }));
+    }
+  }
+  const appKeyLabel = provider === 'FEISHU' ? t('notificationAppIdLabel') : isWecom ? t('wecomBotId') : t('notificationAppKeyLabel');
+  const appKeyPlaceholder = provider === 'FEISHU' ? 'cli_xxxxxx' : isWecom ? t('wecomBotIdPlaceholder') : 'dingxxxxxx';
+  const appKeyRequiredMessage = isWecom ? t('wecomBotIdRequired') : t('appKeyRequired');
+  const appSecretLabel = isWecom ? t('wecomSecret') : t('notificationAppSecretLabel');
+  const appSecretRequiredMessage = isWecom ? t('wecomSecretRequired') : t('appSecretRequired');
 
   useEffect(() => {
     if (data) {
@@ -244,7 +298,7 @@ export function BrandingConfigPage() {
   });
 
   const imMutation = useMutation({
-    mutationFn: ({ targetProvider, params }: { targetProvider: string; params: UpdateDingTalkImChannelParams }) => targetProvider === 'FEISHU' ? updateFeishuImChannel(params) : updateDingTalkImChannel(params),
+    mutationFn: ({ targetProvider, params }: { targetProvider: string; params: UpdateDingTalkImChannelParams }) => targetProvider === 'FEISHU' ? updateFeishuImChannel(params) : targetProvider === 'WECOM' ? updateWecomImChannel(params) : updateDingTalkImChannel(params),
     onSuccess: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: PLATFORM_IM_CHANNELS_QUERY_KEY }),
@@ -504,7 +558,7 @@ export function BrandingConfigPage() {
     </>
   );
 
-  const switchTargetLabel = switchTarget === 'FEISHU' ? t('feishu') : t('dingtalk');
+  const otherProviders = PROVIDER_ORDER.filter((item) => item !== provider);
   const imDirty = notificationDirty || groupChatDirty;
   const notificationPane = (
     <div className="aw-platform-message-panels">
@@ -525,14 +579,14 @@ export function BrandingConfigPage() {
           <Button
             onClick={() => {
               if (channelWriteLock.current || !messageWritesAvailable) return;
-              setSwitchTarget(provider === 'FEISHU' ? 'DINGTALK' : 'FEISHU');
+              setSwitchTarget(otherProviders[0]);
               setSwitchError(null);
               setSwitchOpen(true);
             }}
             disabled={notificationDisabled}
           >
             {selectionKnown
-              ? t('switchChannel', { provider: provider === 'FEISHU' ? t('dingtalk') : t('feishu') })
+              ? t('switchChannel', { provider: providerLabelOf(otherProviders[0]) })
               : t('switchChannelPending')}
           </Button>
         </div>
@@ -558,6 +612,11 @@ export function BrandingConfigPage() {
                     <Tag color={imChannel.enabled ? 'green' : undefined} className={imChannel.enabled ? undefined : 'aw-tag-gray'}>{imChannel.enabled ? t('savedEnabled') : t('savedDisabled')}</Tag>
                     <Tag color={hasImSecret ? 'green' : undefined} className={hasImSecret ? undefined : 'aw-tag-gray'}>{hasImSecret ? t('secretConfigured') : t('secretMissing')}</Tag>
                     <Tag color={imReady ? 'green' : 'orange'}>{imReady ? t('ready') : t('notReady')}</Tag>
+                    {isWecom && (
+                      <Tag color={WECOM_CONNECTION_COLORS[wecomConnection] ?? 'default'}>
+                        {t('wecomConnectionLabel', { status: wecomConnectionLabel })}
+                      </Tag>
+                    )}
                   </>
                 ) : <Tag className="aw-tag-gray">{t('groupChatStatusUnknown')}</Tag>}
               </div>
@@ -600,6 +659,17 @@ export function BrandingConfigPage() {
             <div className="aw-channel-section">
               <Typography.Text type="secondary">{t('notificationSectionHint')}</Typography.Text>
 
+              {isWecom && (
+                <Alert
+                  type={wecomConnection === WECOM_CONNECTED && imReady ? 'success' : 'warning'}
+                  showIcon
+                  message={t('wecomConnectionSeparate')}
+                  description={wecomReadinessReasons.length > 0
+                    ? <>{wecomReadinessReasons.map((reason) => <div key={reason}>{reason}</div>)}</>
+                    : t('wecomReadyHint')}
+                />
+              )}
+
               <div className="aw-config-check-row">
                 <label className="aw-config-check">
                   <Form.Item name="enabled" valuePropName="checked" noStyle>
@@ -611,8 +681,8 @@ export function BrandingConfigPage() {
               </div>
 
               <div className="aw-platform-message-fields">
-                <Form.Item label={provider === 'FEISHU' ? t('notificationAppIdLabel') : t('notificationAppKeyLabel')} name="appKey" validateTrigger={[]} rules={[({ getFieldValue }) => ({ validator: (_, value) => !getFieldValue('enabled') || value ? Promise.resolve() : Promise.reject(new Error(t('appKeyRequired'))) })]}>
-                  <Input placeholder={provider === 'FEISHU' ? 'cli_xxxxxx' : 'dingxxxxxx'} />
+                <Form.Item label={appKeyLabel} name="appKey" validateTrigger={[]} rules={[({ getFieldValue }) => ({ validator: (_, value) => !getFieldValue('enabled') || value ? Promise.resolve() : Promise.reject(new Error(appKeyRequiredMessage)) })]}>
+                  <Input placeholder={appKeyPlaceholder} />
                 </Form.Item>
                 {provider === 'DINGTALK' && <Form.Item label={t('notificationRobotCodeLabel')} name="robotCode" validateTrigger={[]} rules={[({ getFieldValue }) => ({ validator: (_, value) => !getFieldValue('enabled') || value ? Promise.resolve() : Promise.reject(new Error(t('robotCodeRequired'))) })]}>
                   <Input placeholder="robot_xxxxxx" />
@@ -621,10 +691,10 @@ export function BrandingConfigPage() {
                   <Input placeholder={FEISHU_DEFAULT_BASE_URL} />
                 </Form.Item>}
                 <Form.Item
-                  label={t('notificationAppSecretLabel')}
+                  label={appSecretLabel}
                   name="appSecret"
                   validateTrigger={[]}
-                  rules={[({ getFieldValue }) => ({ validator: (_, value) => !getFieldValue('enabled') || value || imChannel.secretConfigured ? Promise.resolve() : Promise.reject(new Error(t('appSecretRequired'))) })]}
+                  rules={[({ getFieldValue }) => ({ validator: (_, value) => !getFieldValue('enabled') || value || imChannel.secretConfigured ? Promise.resolve() : Promise.reject(new Error(appSecretRequiredMessage)) })]}
                   extra={imChannel.secretConfigured ? t('notificationSecretConfiguredHint') : t('notificationSecretMissingHint')}
                 >
                   <Input.Password autoComplete="new-password" iconRender={visible => <Button type="text" htmlType="button" aria-label={t(visible ? 'hideSecret' : 'showSecret')} disabled={notificationDisabled} icon={visible ? <EyeOutlined aria-hidden="true" /> : <EyeInvisibleOutlined aria-hidden="true" />} />} placeholder={imChannel.secretConfigured ? t('keepSecret') : t('secretPlaceholder')} />
@@ -650,7 +720,7 @@ export function BrandingConfigPage() {
         className="aw-platform-channel-modal"
         width={520}
         title={t('switchChannelTitle')}
-        okText={t('confirmSwitchChannel', { provider: switchTargetLabel })}
+        okText={t('confirmSwitchChannel', { provider: providerLabelOf(switchTarget) })}
         cancelText={t('cancel')}
         confirmLoading={switchSubmitting}
         okButtonProps={{ disabled: notificationDisabled }}
@@ -663,6 +733,12 @@ export function BrandingConfigPage() {
         destroyOnClose
       >
         <p>{t('switchChannelBody')}</p>
+        <Radio.Group
+          value={switchTarget}
+          onChange={(event) => setSwitchTarget(event.target.value)}
+          options={otherProviders.map((item) => ({ label: providerLabelOf(item), value: item }))}
+          style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 16 }}
+        />
         {imDirty && <NoticeTip kind="warning" title={t('switchChannelDirty')} />}
         {switchError != null && <p className="aw-channel-switch-error" role="alert">{switchError}</p>}
       </Modal>

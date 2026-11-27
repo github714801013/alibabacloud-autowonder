@@ -25,6 +25,9 @@ public interface AgentConversationTurnDao {
     List<AgentConversationTurnDO> listActiveWorkflowTurns(@Param("afterId") long afterId,
             @Param("limit") int limit);
 
+    List<AgentConversationTurnDO> listActiveWecomTurns(@Param("afterId") long afterId,
+            @Param("cutoff") Date cutoff, @Param("limit") int limit);
+
     AgentConversationTurnDO findByExternalMsgId(@Param("tenantId") Long tenantId,
             @Param("externalMsgId") String externalMsgId);
 
@@ -39,6 +42,12 @@ public interface AgentConversationTurnDao {
 
     AgentConversationTurnDO findNextQueuedInbound(@Param("tenantId") Long tenantId,
             @Param("conversationId") Long conversationId);
+
+    AgentConversationTurnDO findLatestInbound(@Param("tenantId") Long tenantId,
+            @Param("conversationId") Long conversationId);
+
+    int resetFailedInboundForRetry(@Param("tenantId") Long tenantId,
+            @Param("conversationId") Long conversationId, @Param("id") Long id);
 
     List<AgentConversationTurnDO> listQueuedInboundAfter(@Param("afterId") long afterId,
             @Param("limit") int limit);

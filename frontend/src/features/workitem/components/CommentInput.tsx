@@ -1,14 +1,19 @@
 import { i18n } from '@/shared/i18n';
 import { useTranslation } from 'react-i18next';
 import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type CSSProperties, type ChangeEvent, type KeyboardEvent } from 'react';
-import { Alert, Button, Input, Space, message } from 'antd';
+import { Alert, Button, Input, Select, Space, message } from 'antd';
 import type { TextAreaRef } from 'antd/es/input/TextArea';
 import { PaperClipOutlined } from '@ant-design/icons';
 import { MentionMenu, type MentionMenuRow, type MentionMenuSection } from '@/shared/ui/MentionMenu';
+import { useQuery } from '@tanstack/react-query';
 import { useAddComment, useMentionCandidates, useUploadRequirementDocuments } from '../hooks';
 import type { Artifact, Participant } from '@/shared/types/workitem';
 import { ApiError, ErrorCodes } from '@/shared/types/common';
 import { useAccessCommand } from '@/shared/auth/useAccessCommand';
+import { getAiCollaborationDefaults } from '@/features/settings/api';
+import { readLocalClarifyDefaults } from '@/features/settings/aiDefaults';
+import { renderPromptTemplate, resolvePromptTemplates } from '@/features/settings/clarificationPromptTemplates';
+import { useIsMobile } from '@/shared/ui/useIsMobile';
 import {
   DOCUMENT_ACCEPT_ATTRIBUTE, DOCUMENT_UPLOAD_MESSAGES, documentsFromDataTransfer,
   filesFromClipboard, pastedFileForUpload, transferContainsFiles, validateDocumentSelection,
@@ -57,7 +62,9 @@ function findActiveMentionQuery(value: string, caretIndex: number): string | nul
 
 export function CommentInput({ workitemId, participants = [], documents = [] }: CommentInputProps) {
   const { t } = useTranslation('workitem');
+  const isMobile = useIsMobile();
   const [content, setContent] = useState('');
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string | undefined>();
   const [targetAgentIds, setTargetAgentIds] = useState<number[]>([]);
   const [targetHumanIds, setTargetHumanIds] = useState<number[]>([]);
   const [selectedMentionNames, setSelectedMentionNames] = useState<Map<string, string>>(new Map());
@@ -79,6 +86,43 @@ export function CommentInput({ workitemId, participants = [], documents = [] }: 
   const [dragActive, setDragActive] = useState(false);
   const dragDepth = useRef(0);
   const busy = isPending || sending;
+
+  const aiDefaults = useQuery({
+    queryKey: ['ai-collaboration-defaults'],
+    queryFn: getAiCollaborationDefaults,
+    staleTime: 5 * 60_000,
+  });
+  // 本地模板覆盖仅对非所有者生效，且需空间配置查询成功后参与解析，与澄清面板保持一致。
+  const localClarifyDefaults = useMemo(
+    () => (aiDefaults.data?.owner ? {} : readLocalClarifyDefaults()),
+    [aiDefaults.data?.owner],
+  );
+  const builtinTemplateTexts = useMemo(() => ({
+    firstName: t('clarification.builtinFirstTemplateName'),
+    firstContent: t('clarification.bootstrapPrompt', { workitemId: '{{workitemId}}' }),
+    reclarifyName: t('clarification.builtinReclarifyTemplateName'),
+    reclarifyContent: t('clarification.reclarifyPrompt', { workitemId: '{{workitemId}}' }),
+  }), [t]);
+  const spacePromptTemplates = aiDefaults.data?.clarify?.promptTemplates;
+  const useLocalTemplateOverrides = aiDefaults.isSuccess && spacePromptTemplates !== undefined;
+  const resolvedTemplates = useMemo(
+    () => resolvePromptTemplates(
+      builtinTemplateTexts,
+      spacePromptTemplates,
+      useLocalTemplateOverrides ? localClarifyDefaults : {},
+    ),
+    [builtinTemplateTexts, spacePromptTemplates, useLocalTemplateOverrides, localClarifyDefaults],
+  );
+  const templateOptions = useMemo(() => {
+    const optionsOf = (kind: 'builtin' | 'custom') => resolvedTemplates.templates
+      .filter((template) => template.kind === kind)
+      .map((template) => ({ value: template.id, label: template.name }));
+    const custom = optionsOf('custom');
+    return [
+      { label: t('comment.builtinTemplateGroup'), options: optionsOf('builtin') },
+      ...(custom.length > 0 ? [{ label: t('comment.customTemplateGroup'), options: custom }] : []),
+    ];
+  }, [resolvedTemplates, t]);
 
   const selectFiles = (files: File[]) => {
     if (sendLock.current || isPending || files.length === 0) return;
@@ -267,6 +311,17 @@ export function CommentInput({ workitemId, participants = [], documents = [] }: 
     });
   };
 
+  const handleTemplateSelect = (templateId: string) => {
+    const template = resolvedTemplates.templates.find((item) => item.id === templateId);
+    if (!template) return;
+    const nextValue = renderPromptTemplate(template.content, workitemId);
+    setSelectedTemplateId(templateId);
+    setContent(nextValue);
+    syncSelectedMentions(nextValue);
+    clearMentionQuery();
+    textAreaRef.current?.focus();
+  };
+
   const handleSend = () => {
     const trimmed = content.trim();
     if (sendLock.current || isPending || (!trimmed && attachments.length === 0)) return;
@@ -299,6 +354,7 @@ export function CommentInput({ workitemId, participants = [], documents = [] }: 
             setAttachments([]);
             setDeliveryClosed(false);
             setContent('');
+            setSelectedTemplateId(undefined);
             setTargetAgentIds([]);
             setTargetHumanIds([]);
             setSelectedMentionNames(new Map());
@@ -481,7 +537,8 @@ export function CommentInput({ workitemId, participants = [], documents = [] }: 
             rows={isExpanded ? 3 : 1}
             placeholder={t('comment.placeholder')}
             disabled={busy}
-            style={{ width: '100%', padding: 0, ...composerTextStyle }}
+            // 移动端系统聚焦小输入框会放大页面，16px 可避免。
+            style={{ width: '100%', padding: 0, ...composerTextStyle, ...(isMobile ? { fontSize: 16 } : null) }}
           />
         </div>
         {attachments.length > 0 && (
@@ -496,6 +553,17 @@ export function CommentInput({ workitemId, participants = [], documents = [] }: 
           <input ref={fileInputRef} type="file" multiple accept={DOCUMENT_ACCEPT_ATTRIBUTE}
             aria-label={t('comment.attachFiles')} data-testid="comment-file-input" hidden disabled={busy}
             onChange={(event) => { selectFiles(Array.from(event.target.files ?? [])); event.target.value = ''; }} />
+          <Select
+            size="small"
+            data-testid="comment-template-select"
+            aria-label={t('comment.insertTemplate')}
+            placeholder={t('comment.insertTemplate')}
+            value={selectedTemplateId}
+            onSelect={handleTemplateSelect}
+            options={templateOptions}
+            disabled={busy}
+            style={{ minWidth: 120, maxWidth: 180 }}
+          />
           <Button size="small" className="aw-card-head-btn" icon={<PaperClipOutlined />} disabled={busy}
             onClick={() => accessCommand('READ_WRITE', t('comment.attachFiles'), () => fileInputRef.current?.click())}>
             {t('comment.attachFiles')}

@@ -218,25 +218,42 @@ describe('SettingsPage', () => {
     });
   });
 
-  it('keeps save commands visible but blocks read-only users before mutation', async () => {
-    let quotaUpdates = 0;
-    useAuthStore.getState().setCurrentWorkspace({ id: 1, name: 'O', description: '' }, 'READ_ONLY');
-    useCommonSettingsHandlers([
-      http.put('/api/ai-usage/quota', () => {
-        quotaUpdates += 1;
-        return HttpResponse.json(apiOk(null));
-      }),
-    ]);
+  it('renders AI collaboration defaults in a dedicated settings tab', async () => {
+    useCommonSettingsHandlers([]);
+
+    renderPage();
+    await userEvent.click(await screen.findByRole('tab', { name: 'AI 默认值' }));
+
+    expect(await screen.findByText('需求澄清')).toBeInTheDocument();
+    expect(screen.getByText('开始交付')).toBeInTheDocument();
+    expect(await screen.findByText('保存后仅对当前浏览器生效')).toBeInTheDocument();
+  });
+
+  it('shows all four tabs to workspace admins', async () => {
+    useCommonSettingsHandlers([]);
 
     renderPage();
 
-    const saveButton = await screen.findByRole('button', { name: /保存AI配置/ });
-    expect(saveButton).toBeEnabled();
-    await userEvent.click(saveButton);
-
-    expect(quotaUpdates).toBe(0);
-    expect(await screen.findByText('当前为只读权限，保存AI配置需要管理员权限')).toBeInTheDocument();
+    expect(await screen.findByRole('tab', { name: 'AI 配置' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: '通知配置' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: '系统配置' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'AI 默认值' })).toBeInTheDocument();
   });
+
+  it.each(['READ_WRITE', 'READ_ONLY'] as const)(
+    'keeps all settings tabs visible to %s members',
+    async (accessLevel) => {
+      useAuthStore.getState().setCurrentWorkspace({ id: 1, name: 'O', description: '' }, accessLevel);
+      useCommonSettingsHandlers([]);
+
+      renderPage();
+
+      expect(await screen.findByRole('tab', { name: 'AI 配置' })).toBeInTheDocument();
+      expect(screen.getByRole('tab', { name: '通知配置' })).toBeInTheDocument();
+      expect(screen.getByRole('tab', { name: '系统配置' })).toBeInTheDocument();
+      expect(screen.getByRole('tab', { name: 'AI 默认值' })).toBeInTheDocument();
+    },
+  );
 });
 
 it('only saves Feishu settings and preferences when the platform selects Feishu', async () => {
@@ -254,6 +271,57 @@ it('only saves Feishu settings and preferences when the platform selects Feishu'
   expect(await screen.findByLabelText('启用飞书通知')).toBeInTheDocument();
   expect(screen.queryByLabelText('启用钉钉通知')).not.toBeInTheDocument();
   await userEvent.click(screen.getByRole('button', { name: /保存通知配置/ }));
-  await waitFor(() => expect(saved.prefs?.items[0]).toEqual({ type: 'WORKITEM_ASSIGNED', inApp: true, feishu: true, dingtalk: false }));
+  await waitFor(() => expect(saved.prefs?.items[0]).toEqual({ type: 'WORKITEM_ASSIGNED', inApp: true, feishu: true, dingtalk: false, wecom: false }));
   expect(saved.settings?.items).toEqual([{ key: 'feishu_enabled', valueJson: 'true', secret: false }]);
+});
+
+it('starts the WeCom preference off and saves only the WeCom switch', async () => {
+  const saved: { prefs?: { items: NotifyPrefItem[] }; settings?: { items: SettingItem[] } } = {};
+  useAuthStore.getState().setCurrentWorkspace({ id: 1, name: 'O', description: '' }, 'ADMIN');
+  useCommonSettingsHandlers([
+    http.get('/api/platform/im-channels', () => HttpResponse.json(apiOk([{ provider: 'WECOM', selected: true, enabled: false }]))),
+    http.get('/api/settings/NOTIFY', () => HttpResponse.json(apiOk([{ key: 'wecom_enabled', valueJson: 'true', secret: false }]))),
+    http.get('/api/notifications/prefs', () => HttpResponse.json(apiOk([{ type: 'WORKITEM_ASSIGNED', inApp: true, wecom: false }]))),
+    http.put('/api/notifications/prefs', async ({ request }) => { saved.prefs = await request.json() as { items: NotifyPrefItem[] }; return HttpResponse.json(apiOk(null)); }),
+    http.put('/api/settings/NOTIFY', async ({ request }) => { saved.settings = await request.json() as { items: SettingItem[] }; return HttpResponse.json(apiOk(null)); }),
+  ]);
+  renderPage();
+  await userEvent.click(await screen.findByRole('tab', { name: '通知配置' }));
+
+  expect(await screen.findByLabelText('启用企业微信通知')).toBeInTheDocument();
+  expect(screen.queryByLabelText('启用飞书通知')).not.toBeInTheDocument();
+  expect(screen.queryByLabelText('启用钉钉通知')).not.toBeInTheDocument();
+  const preference = screen.getByRole('switch', { name: '工单指派：企业微信' });
+  expect(preference).not.toBeChecked();
+
+  await userEvent.click(preference);
+  await userEvent.click(screen.getByRole('button', { name: /保存通知配置/ }));
+
+  await waitFor(() => expect(saved.prefs?.items[0]).toEqual({ type: 'WORKITEM_ASSIGNED', inApp: true, wecom: true, dingtalk: false, feishu: false }));
+  expect(saved.settings?.items).toEqual([{ key: 'wecom_enabled', valueJson: 'true', secret: false }]);
+});
+
+it('defaults the conversation dispatch failure WeCom switch on and saves an explicit off', async () => {
+  const saved: { prefs?: { items: NotifyPrefItem[] } } = {};
+  useAuthStore.getState().setCurrentWorkspace({ id: 1, name: 'O', description: '' }, 'ADMIN');
+  useCommonSettingsHandlers([
+    http.get('/api/platform/im-channels', () => HttpResponse.json(apiOk([{ provider: 'WECOM', selected: true, enabled: true }]))),
+    http.get('/api/settings/NOTIFY', () => HttpResponse.json(apiOk([{ key: 'wecom_enabled', valueJson: 'true', secret: false }]))),
+    http.get('/api/notifications/prefs', () => HttpResponse.json(apiOk([{ type: 'WORKITEM_ASSIGNED', inApp: true, wecom: false }]))),
+    http.put('/api/notifications/prefs', async ({ request }) => { saved.prefs = await request.json() as { items: NotifyPrefItem[] }; return HttpResponse.json(apiOk(null)); }),
+    http.put('/api/settings/NOTIFY', () => HttpResponse.json(apiOk(null))),
+  ]);
+  renderPage();
+  await userEvent.click(await screen.findByRole('tab', { name: '通知配置' }));
+
+  const wecomSwitch = await screen.findByRole('switch', { name: '会话推送失败：企业微信' });
+  expect(wecomSwitch).toBeChecked();
+  expect(screen.getByRole('switch', { name: '会话推送失败：站内' })).toBeChecked();
+
+  await userEvent.click(wecomSwitch);
+  await userEvent.click(screen.getByRole('button', { name: /保存通知配置/ }));
+
+  await waitFor(() => expect(saved.prefs?.items).toContainEqual({
+    type: 'CONVERSATION_DISPATCH_FAILED', inApp: true, wecom: false, dingtalk: false, feishu: false,
+  }));
 });

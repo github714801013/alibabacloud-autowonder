@@ -105,7 +105,7 @@ public class NotifyService {
                     : prefDao.findByUserAndType(event.getTenantId(), recipientId, event.getType());
 
             for (NamedChannel channel : namedChannels) {
-                if (!shouldDeliver(channel.name(), pref)) {
+                if (!shouldDeliver(channel.name(), pref, event.getType())) {
                     continue;
                 }
                 if (IN_APP_CHANNEL.equals(channel.name())) {
@@ -210,8 +210,15 @@ public class NotifyService {
         return false;
     }
 
-    /** 旧个人偏好只保留站内开关语义；IM 同步条件由渠道按平台配置与接收身份自行判定。 */
-    private boolean shouldDeliver(String channelName, NotifyPrefDO pref) {
+    /** 企业微信按默认开关与显式偏好判定；站内按个人开关；其余 IM 渠道由渠道按平台配置判定。 */
+    private boolean shouldDeliver(String channelName, NotifyPrefDO pref, String type) {
+        if ("wecom".equals(channelName)) {
+            // 企业微信默认关闭，会话推送失败类型例外；显式偏好行始终优先。
+            if (pref == null) {
+                return NotifyTypeDefaults.wecomDefaultOn(type);
+            }
+            return pref.getWecom() != null && pref.getWecom() == 1;
+        }
         if (!IN_APP_CHANNEL.equals(channelName)) {
             return true;
         }

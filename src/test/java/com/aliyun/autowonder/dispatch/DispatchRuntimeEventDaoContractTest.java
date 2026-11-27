@@ -66,6 +66,30 @@ class DispatchRuntimeEventDaoContractTest {
     }
 
     @Test
+    void traceProjectionExcludesAgentMessagesAndKeepsArrivalOrder() throws Exception {
+        String xml = new String(getClass().getResourceAsStream(
+                "/mapping/DispatchRuntimeEventDao.xml").readAllBytes(), StandardCharsets.UTF_8);
+        int start = xml.indexOf("id=\"listByDispatchForTrace\"");
+        assertTrue(start >= 0, "listByDispatchForTrace select must exist");
+        int end = xml.indexOf("</select>", start);
+        String sql = xml.substring(start, end).replace("&lt;", "<").replace("&gt;", ">");
+
+        assertTrue(sql.contains("tenant_id = #{tenantId}"));
+        assertTrue(sql.contains("dispatch_id = #{dispatchId}"));
+        assertTrue(sql.contains("event_type <> 'agent.message'"));
+        assertTrue(sql.contains("ORDER BY id ASC"));
+
+        int latestStart = xml.indexOf("id=\"findLatestIdForTrace\"");
+        assertTrue(latestStart >= 0, "findLatestIdForTrace select must exist");
+        String latestSql = xml.substring(latestStart, xml.indexOf("</select>", latestStart))
+                .replace("&lt;", "<").replace("&gt;", ">");
+        assertTrue(latestSql.contains("MAX(id)"));
+        assertTrue(latestSql.contains("event_type <> 'agent.message'"));
+        assertTrue(latestSql.contains("tenant_id = #{tenantId}"));
+        assertTrue(latestSql.contains("dispatch_id = #{dispatchId}"));
+    }
+
+    @Test
     void activityTimelineUsesPersistentArrivalOrderWithoutSequenceFallback() throws Exception {
         String xml = new String(getClass().getResourceAsStream(
                 "/mapping/DispatchRuntimeEventDao.xml").readAllBytes(), StandardCharsets.UTF_8);

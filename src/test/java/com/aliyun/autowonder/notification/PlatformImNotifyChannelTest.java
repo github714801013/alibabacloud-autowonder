@@ -124,4 +124,61 @@ class PlatformImNotifyChannelTest {
         notification.setContent("用户 A 提交了注册申请");
         return notification;
     }
+
+    @Test
+    void wecomGenericNotificationsQueueTheSnapshotOnTheReliableQueue() {
+        when(configs.selectedProvider()).thenReturn("WECOM");
+        when(configs.isReady("WECOM")).thenReturn(true);
+        when(branding.effectivePublicBaseUrl()).thenReturn("https://auto.example.com");
+        UserImIdentityDO identity = new UserImIdentityDO();
+        identity.setExternalUserId("staff-001");
+        when(identities.find(2L, "WECOM")).thenReturn(identity);
+        var notification = new NotificationDO();
+        notification.setId(99L); notification.setTenantId(1L); notification.setRecipientId(2L);
+        notification.setType("SCHEDULED_TASK_RUN_SUCCEEDED");
+        notification.setTitle("定时任务完成"); notification.setContent("任务内容");
+        notification.setRecipientLocale("en-US");
+
+        assertTrue(channel.deliver(notification));
+
+        var task = ArgumentCaptor.forClass(com.aliyun.autowonder.im.notification.ImNotificationTask.class);
+        verify(queue).enqueue(task.capture());
+        assertEquals("WECOM", task.getValue().provider());
+        assertEquals("SCHEDULED_TASK_RUN_SUCCEEDED", task.getValue().notificationType());
+        assertEquals("en-US", task.getValue().recipientLocale());
+        // 官方快照通道：标题与正文随任务携带，由工人按接收者语言渲染，渠道语义（WECOM）保持不变。
+        assertEquals("定时任务完成", task.getValue().notificationTitle());
+        assertEquals("任务内容", task.getValue().notificationContent());
+        assertTrue(task.getValue().bypassesLegacyImPreference());
+        assertTrue(task.getValue().hasNotificationSnapshot());
+    }
+
+    @Test
+    void inputRequiredTaskCarriesNotificationLink() {
+        when(configs.selectedProvider()).thenReturn("WECOM");
+        when(configs.isReady("WECOM")).thenReturn(true);
+        when(branding.effectivePublicBaseUrl()).thenReturn("https://auto.example.com");
+        UserImIdentityDO identity = new UserImIdentityDO();
+        identity.setExternalUserId("staff-001");
+        when(identities.find(2L, "WECOM")).thenReturn(identity);
+        var notification = new NotificationDO();
+        notification.setId(99L);
+        notification.setTenantId(1L);
+        notification.setRecipientId(2L);
+        notification.setRefId(42L);
+        notification.setType("WORKITEM_INPUT_REQUIRED");
+        notification.setTitle("需求澄清待回答");
+        notification.setContent("工单「测试工单」\n请确认以下范围");
+        notification.setLink("/workitems/42?workspaceId=1&panel=clarify&fullscreen=1&agent=10035&conversation=20");
+
+        assertTrue(channel.deliver(notification));
+
+        var task = ArgumentCaptor.forClass(com.aliyun.autowonder.im.notification.ImNotificationTask.class);
+        verify(queue).enqueue(task.capture());
+        // 澄清深链经官方快照通道转成绝对 notificationLink，仍由 WECOM 任务承载。
+        assertEquals("WECOM", task.getValue().provider());
+        assertEquals("WORKITEM_INPUT_REQUIRED", task.getValue().notificationType());
+        assertEquals("https://auto.example.com/workitems/42?workspaceId=1&panel=clarify&fullscreen=1&agent=10035&conversation=20",
+                task.getValue().notificationLink());
+    }
 }

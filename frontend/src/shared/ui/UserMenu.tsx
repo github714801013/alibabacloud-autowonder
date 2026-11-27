@@ -5,6 +5,7 @@ import { AwStrokeIcon } from '@/shared/ui/AwStrokeIcon';
 import { useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import { useAuthStore } from '@/shared/auth/store';
+import { disconnectRealtime } from '@/shared/realtime/client';
 import { logout } from '@/features/auth/api';
 /** Shared signed-in account control for workspace selection and app headers. */
 export function UserMenu() {
@@ -19,6 +20,7 @@ export function UserMenu() {
     if (refreshToken) {
       try { await logout(refreshToken); } catch { /* ignore */ }
     }
+    disconnectRealtime();
     clear();
     queryClient.clear();
     navigate('/login');

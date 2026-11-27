@@ -9,7 +9,7 @@ import { runtimeStatusLabel } from '../runtimeLabels';
 import { useTranslation } from 'react-i18next';
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { Alert, Button, Drawer, Empty, Spin, Tag, Typography } from 'antd';
+import { Alert, Button, Drawer, Empty, Space, Spin, Tag, Typography } from 'antd';
 import type {
   ProcessGraph, ProcessGraphNode, RuntimeTrace, RuntimeTraceBoundary, RuntimeTraceContextFile,
   RuntimeTraceEvent, RuntimeTraceObservation, RuntimeTraceSession, RuntimeTraceSpan, RuntimeTraceTurn,
@@ -20,6 +20,7 @@ import { FailureHistoryPanel } from './FailureHistoryPanel';
 import './RuntimeTraceDrawer.css';
 
 const { Text } = Typography;
+const TRACE_PAGE_SIZE = 100;
 const ACTIVE_STATUSES = new Set(['RUNNING', 'ACKED', 'DISPATCHED', 'PAUSING']);
 const FAILURE_EVENT_TYPES = new Set(['step.failed', 'session.failed']);
 const FIRST_CAUSE_REASON = /^tool_hook_blocked\b/;
@@ -330,7 +331,17 @@ function TurnCard({ session, turn, stats, open, selectedKey, onToggle, onSelect 
   </div>;
 }
 
-function TraceTimeline({ trace, selectedKey, onSelect }: { trace: RuntimeTrace; selectedKey: string | null; onSelect: (selection: Selection) => void }) {
+interface TraceTimelineProps {
+  trace: RuntimeTrace;
+  selectedKey: string | null;
+  onSelect: (selection: Selection) => void;
+  onLoadEarlier: () => void;
+  onBackToLatest: () => void;
+  loadingEarlier: boolean;
+  browsingEarlier: boolean;
+}
+
+function TraceTimeline({ trace, selectedKey, onSelect, onLoadEarlier, onBackToLatest, loadingEarlier, browsingEarlier }: TraceTimelineProps) {
   const { t } = useTranslation('workitem');
   const runtimeEvents = (trace.events || []).filter((event) => !event.detail?.sessionId);
   const [runtimeOpen, setRuntimeOpen] = useState<boolean | null>(null);
@@ -339,6 +350,10 @@ function TraceTimeline({ trace, selectedKey, onSelect }: { trace: RuntimeTrace; 
   const isOpen = (key: string) => openTurns[key] ?? false;
   const groupOpen = runtimeOpen ?? (runtimeEvents.some((event) => FAILURE_EVENT_TYPES.has(event.eventType)) || !trace.sessions.length);
   return <div className="runtime-trace-tl">
+    {(trace.nextBeforeId != null || browsingEarlier) && <Space style={{ marginBottom: 12 }}>
+      {trace.nextBeforeId != null && <Button size="small" loading={loadingEarlier} onClick={onLoadEarlier}>{t('trace.loadEarlier')}</Button>}
+      {browsingEarlier && <Button size="small" onClick={onBackToLatest}>{t('trace.backToLatest')}</Button>}
+    </Space>}
     {!!runtimeEvents.length && <div>
       <button type="button" className="runtime-trace-grp" aria-expanded={groupOpen} onClick={() => setRuntimeOpen(!groupOpen)}>
         <Chevron open={groupOpen} />
@@ -532,7 +547,10 @@ export function RuntimeTracePanel({ dispatchId, status, node, processGraph, visi
     bytes: ArrayBuffer;
     isCurrent: () => boolean;
   } | null>(null);
+  const [browsingEarlier, setBrowsingEarlier] = useState(false);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
   const lastSeq = useRef<number | null>(null);
+  const traceEpoch = useRef(0);
   const detailPane = useRef<HTMLDivElement | null>(null);
   const selectionGeneration = useRef(0);
   const contextGeneration = useRef(0);
@@ -546,9 +564,10 @@ export function RuntimeTracePanel({ dispatchId, status, node, processGraph, visi
     lifecycle.current = { dispatchId, nodeKey, active, visible, valid: true };
     selectionGeneration.current += 1;
     contextGeneration.current += 1;
+    traceEpoch.current += 1;
     lastSeq.current = null;
     setTrace(null); setSelection(null); setPendingKey(null); setDetailLoading(false); setError(null); setContextPreview(null);
-    setContextDownload(null);
+    setContextDownload(null); setBrowsingEarlier(false); setLoadingEarlier(false);
     setLoading(visible && dispatchId != null);
   }
   const scope = lifecycle.current;
@@ -565,16 +584,17 @@ export function RuntimeTracePanel({ dispatchId, status, node, processGraph, visi
   const failureHistory = useMemo(() => failureHistoryOf(trace?.events), [trace]);
 
   useEffect(() => {
-    if (!visible || dispatchId == null) return undefined;
+    if (!visible || dispatchId == null || browsingEarlier) return undefined;
     let cancelled = false;
     let timer: number | undefined;
     const current = () => !cancelled && scope.valid && lifecycle.current === scope;
     setLoading(true);
     const load = async () => {
       if (!current()) return;
+      const epoch = traceEpoch.current;
       try {
-        const next = await getRuntimeTrace(dispatchId, lastSeq.current);
-        if (!current()) return;
+        const next = await getRuntimeTrace(dispatchId, lastSeq.current, { limit: TRACE_PAGE_SIZE });
+        if (!current() || epoch !== traceEpoch.current) return;
         if (next.changed || lastSeq.current == null) {
           setTrace(next);
           setSelection((selection) => selection || (next.sessions[0] ? { kind: 'session', session: next.sessions[0] } : null));
@@ -592,7 +612,35 @@ export function RuntimeTracePanel({ dispatchId, status, node, processGraph, visi
     };
     void load();
     return () => { cancelled = true; if (timer != null) window.clearTimeout(timer); };
-  }, [active, dispatchId, visible, scope]);
+  }, [active, dispatchId, visible, scope, browsingEarlier]);
+
+  const loadEarlier = async () => {
+    if (dispatchId == null || trace?.nextBeforeId == null) return;
+    const beforeId = trace.nextBeforeId;
+    const epoch = ++traceEpoch.current;
+    setLoadingEarlier(true);
+    try {
+      const older = await getRuntimeTrace(dispatchId, null, { limit: TRACE_PAGE_SIZE, beforeId });
+      if (epoch !== traceEpoch.current || !scope.valid) return;
+      // 成功后再次递增，作废本轮在途的轮询响应，避免旧窗口覆盖刚追加的页。
+      traceEpoch.current += 1;
+      setBrowsingEarlier(true);
+      setTrace((previous) => previous == null ? older : {
+        ...previous,
+        events: [...(older.events || []), ...(previous.events || [])],
+        nextBeforeId: older.nextBeforeId ?? null,
+      });
+    } catch (reason) {
+      if (epoch !== traceEpoch.current) return;
+      setError({ message: reason instanceof Error ? reason.message : undefined, fallback: 'trace.loadFailed' });
+    } finally { setLoadingEarlier(false); }
+  };
+
+  const backToLatest = () => {
+    traceEpoch.current += 1;
+    lastSeq.current = null;
+    setBrowsingEarlier(false);
+  };
 
   const continuity = useMemo(() => {
     if (!node || !processGraph) return { previous: null, next: null };
@@ -685,7 +733,15 @@ export function RuntimeTracePanel({ dispatchId, status, node, processGraph, visi
       {loading && !trace ? <div style={{ textAlign: 'center', padding: 60 }}><Spin /></div> : trace && (
         <div data-testid="runtime-trace-panes" className="runtime-trace-panes" style={{ display: 'grid', gridTemplateColumns: 'minmax(240px, 30%) 1fr', flex: 1, minHeight: 0, overflow: 'hidden' }}>
           <div data-testid="runtime-trace-timeline-pane" className="runtime-trace-time" style={{ overflow: 'auto' }}>
-            <TraceTimeline trace={trace} selectedKey={pendingKey ?? (selection ? selectionKey(selection) : null)} onSelect={(next) => void select(next)} />
+            <TraceTimeline
+              trace={trace}
+              selectedKey={pendingKey ?? (selection ? selectionKey(selection) : null)}
+              onSelect={(next) => void select(next)}
+              onLoadEarlier={() => void loadEarlier()}
+              onBackToLatest={backToLatest}
+              loadingEarlier={loadingEarlier}
+              browsingEarlier={browsingEarlier}
+            />
             {!trace.sessions.length && <Empty description={t('trace.empty')} />}
           </div>
           <div data-testid="runtime-trace-detail-pane" className="runtime-trace-detail" ref={detailPane} style={{ overflow: 'auto' }}>

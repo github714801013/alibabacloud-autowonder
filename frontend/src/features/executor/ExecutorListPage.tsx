@@ -198,6 +198,12 @@ export function isLaunchConfigured(config: ExecutorLaunchConfig | null): boolean
   return Boolean(config.model || config.reasoningEffort || config.contextWindow || config.memoryMode);
 }
 
+// 与服务端 ExecutorLaunchExtraArgs.MAX_LENGTH 对齐；这里只是输入护栏，最终校验以服务端为准。
+const EXTRA_ARGS_MAX_LENGTH = 1000;
+
+// 与服务端 ExecutorLaunchConfigService.MAX_PREFIX_COMMAND_LENGTH 对齐；这里只是输入护栏，最终校验以服务端为准。
+const PREFIX_COMMAND_MAX_LENGTH = 4000;
+
 function CopyCommandActions({ onCopy, disabled, split }: { onCopy: (shell?: DebugShell) => void; disabled?: boolean; split?: boolean }) {
   const { t } = useTranslation('executor');
   const debugEntry = (
@@ -256,6 +262,42 @@ function CommandPreview({ text }: { text: string }) {
     <div role="region" aria-label={t('commandPreview')} className="executor-cmd-box">
       {text}
     </div>
+  );
+}
+
+function ExtraArgsField() {
+  const { t } = useTranslation('executor');
+  return (
+    <Form.Item label={t('extraArgs')} name="extraArgs" extra={t('extraArgsHint')}>
+      <Input maxLength={EXTRA_ARGS_MAX_LENGTH} allowClear placeholder={t('extraArgsPlaceholder')} />
+    </Form.Item>
+  );
+}
+
+function PrefixCommandField() {
+  const { t } = useTranslation('executor');
+  return (
+    <Form.Item label={t('prefixCommand')} name="prefixCommand"
+      rules={[{ max: PREFIX_COMMAND_MAX_LENGTH, message: t('prefixCommandTooLong', { max: PREFIX_COMMAND_MAX_LENGTH }) }]}
+      extra={(
+        <div>
+          <div>{t('prefixCommandHint')}</div>
+          <Alert type="warning" showIcon style={{ marginTop: 6 }} message={t('prefixCommandRisk')} />
+        </div>
+      )}>
+      <Input.TextArea rows={3} allowClear placeholder={t('prefixCommandPlaceholder')} />
+    </Form.Item>
+  );
+}
+
+function ServerBaseUrlField() {
+  const { t } = useTranslation('executor');
+  return (
+    <Form.Item label={t('serverBaseUrl')} name="serverBaseUrl"
+      rules={[{ pattern: /^https?:\/\/[^/?#@\s]+$/i, message: t('serverBaseUrlInvalid') }]}
+      extra={t('serverBaseUrlHint')}>
+      <Input allowClear placeholder={t('serverBaseUrlPlaceholder')} />
+    </Form.Item>
   );
 }
 
@@ -353,6 +395,8 @@ interface CreateExecutorFormValues {
   model?: string;
   reasoningEffort?: string;
   contextWindow?: string;
+  extraArgs?: string;
+  prefixCommand?: string;
 }
 
 interface StartupFormValues {
@@ -363,6 +407,9 @@ interface StartupFormValues {
   model?: string;
   reasoningEffort?: string;
   contextWindow?: string;
+  extraArgs?: string;
+  prefixCommand?: string;
+  serverBaseUrl?: string;
 }
 
 export function ExecutorListPage() {
@@ -697,9 +744,9 @@ export function ExecutorListPage() {
 
   const createMut = useMutation({
     // 启动配置随执行器一并落库，响应回显的就是数据库保存下来的值
-    mutationFn: ({ agentId, name, clientKind: kind, memoryMode, maxConcurrentDispatches, model, reasoningEffort, contextWindow }:
+    mutationFn: ({ agentId, name, clientKind: kind, memoryMode, maxConcurrentDispatches, model, reasoningEffort, contextWindow, extraArgs, prefixCommand }:
       CreateExecutorFormValues) =>
-      createExecutor(agentId, { name, clientKind: kind, memoryMode, maxConcurrentDispatches, model, reasoningEffort, contextWindow }),
+      createExecutor(agentId, { name, clientKind: kind, memoryMode, maxConcurrentDispatches, model, reasoningEffort, contextWindow, extraArgs, prefixCommand }),
     onSuccess: (data) => {
       setTokenResult(data);
       setCreateModalOpen(false);
@@ -853,10 +900,19 @@ export function ExecutorListPage() {
         model: config.model ?? undefined,
         reasoningEffort: config.reasoningEffort ?? undefined,
         contextWindow: config.contextWindow ?? undefined,
+        extraArgs: config.extraArgs ?? undefined,
+        prefixCommand: config.prefixCommand ?? undefined,
+        serverBaseUrl: config.serverBaseUrl ?? undefined,
       });
       setStartupModelInvalid(!config.model);
     } else {
-      startupForm.setFieldsValue({ memoryMode: config.memoryMode ?? 'platform', maxConcurrentDispatches: config.maxConcurrentDispatches ?? 5 });
+      startupForm.setFieldsValue({
+        memoryMode: config.memoryMode ?? 'platform',
+        maxConcurrentDispatches: config.maxConcurrentDispatches ?? 5,
+        extraArgs: config.extraArgs ?? undefined,
+        prefixCommand: config.prefixCommand ?? undefined,
+        serverBaseUrl: config.serverBaseUrl ?? undefined,
+      });
     }
     return config;
   };
@@ -905,6 +961,10 @@ export function ExecutorListPage() {
         ...(kindMissing ? { clientKind: values.clientKind } : {}),
         memoryMode: values.memoryMode,
         maxConcurrentDispatches: values.maxConcurrentDispatches,
+        // 扩展参数、前置命令与平台服务地址都与客户端类型无关，非 Qoder 执行器同样提交
+        extraArgs: values.extraArgs,
+        prefixCommand: values.prefixCommand,
+        serverBaseUrl: values.serverBaseUrl,
         ...(isQoder ? {
           model: values.model,
           reasoningEffort: values.reasoningEffort,
@@ -1380,6 +1440,8 @@ export function ExecutorListPage() {
               </Form.Item>
             </div>
           )}
+          <ExtraArgsField />
+          <PrefixCommandField />
         </Form>
       </Modal>
 
@@ -1468,6 +1530,9 @@ export function ExecutorListPage() {
               </Form.Item>
             </div>
           )}
+          <ExtraArgsField />
+          <PrefixCommandField />
+          <ServerBaseUrlField />
         </Form>
         </div>
         {commandDraft !== null ? <>

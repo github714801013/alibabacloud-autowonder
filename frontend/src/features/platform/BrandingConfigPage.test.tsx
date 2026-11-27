@@ -1477,4 +1477,89 @@ it('preserves an unsaved notification draft when group-chat saving refreshes cha
   expect(await screen.findByText('有未保存修改。确认切换即明确放弃当前通知与群聊草稿；此提示不阻止切换。')).toBeInTheDocument();
 });
 
+it('configures the WeCom notification bot with BotID, Secret and connection state', async () => {
+  let saved: UpdateDingTalkImChannelParams | undefined;
+  server.use(
+    http.get('/api/platform/im-channels/selection', () => HttpResponse.json(imSelectionPayload('WECOM', 2))),
+    http.get('/api/platform/im-channels', () => HttpResponse.json({
+      ...imChannelsPayload(),
+      data: [{ provider: 'WECOM', enabled: true, appKey: 'wecom-bot', robotCode: '', secretConfigured: true, ready: true, connectionStatus: 'CONNECTED' }],
+    })),
+    http.get('/api/platform/im-channels/WECOM/group-chat', () => HttpResponse.json(groupChatPayload('WECOM'))),
+    http.put('/api/platform/im-channels/wecom', async ({ request }) => {
+      saved = await request.json() as UpdateDingTalkImChannelParams;
+      return HttpResponse.json({
+        ...imChannelsPayload(),
+        data: [{ provider: 'WECOM', enabled: true, appKey: 'wecom-bot', robotCode: '', secretConfigured: true, ready: true, connectionStatus: 'CONNECTED' }],
+      });
+    }),
+  );
+  renderPage(); await openNotificationTab();
+
+  expect(await screen.findByText('平台当前渠道：企业微信')).toBeInTheDocument();
+  expect(await screen.findByLabelText('BotID')).toHaveValue('wecom-bot');
+  expect(screen.getByLabelText('Secret')).toHaveValue('');
+  expect(screen.queryByLabelText('RobotCode')).not.toBeInTheDocument();
+  expect(screen.getByText('连接状态：已连接')).toBeInTheDocument();
+  expect(screen.getAllByText('保存成功与连接成功分别展示').length).toBeGreaterThan(0);
+
+  await userEvent.type(screen.getByLabelText('Secret'), 'wecom-secret');
+  await userEvent.click(screen.getByRole('button', { name: /保存通知机器人/ }));
+  await waitFor(() => expect(saved).toEqual({
+    enabled: true,
+    appKey: 'wecom-bot',
+    appSecret: 'wecom-secret',
+    robotCode: '',
+  }));
+});
+
+it('explains why the WeCom notification channel is not ready', async () => {
+  server.use(
+    http.get('/api/platform/im-channels/selection', () => HttpResponse.json(imSelectionPayload('WECOM', 2))),
+    http.get('/api/platform/im-channels', () => HttpResponse.json({
+      ...imChannelsPayload(),
+      data: [{ provider: 'WECOM', enabled: true, appKey: 'wecom-bot', robotCode: '', secretConfigured: false, ready: false, connectionStatus: 'CONNECTING' }],
+    })),
+    http.get('/api/platform/im-channels/WECOM/group-chat', () => HttpResponse.json(groupChatPayload('WECOM'))),
+  );
+  renderPage(); await openNotificationTab();
+
+  expect(await screen.findByText('Secret 未配置')).toBeInTheDocument();
+  expect(screen.getByText('连接未建立（连接中）')).toBeInTheDocument();
+  expect(screen.getByText('连接状态：连接中')).toBeInTheDocument();
+});
+
+it('keeps unsaved notification drafts when the WeCom connection poll refreshes', async () => {
+  let calls = 0;
+  server.use(
+    http.get('/api/platform/im-channels/selection', () => HttpResponse.json(imSelectionPayload('WECOM', 2))),
+    http.get('/api/platform/im-channels', () => {
+      calls += 1;
+      return HttpResponse.json({
+        ...imChannelsPayload(),
+        data: [{
+          provider: 'WECOM', enabled: true, appKey: 'wecom-bot', robotCode: '',
+          secretConfigured: true, ready: true, connectionStatus: calls > 1 ? 'CONNECTED' : 'CONNECTING',
+        }],
+      });
+    }),
+    http.get('/api/platform/im-channels/WECOM/group-chat', () => HttpResponse.json(groupChatPayload('WECOM'))),
+  );
+  renderPage(); await openNotificationTab();
+
+  await waitFor(
+    () => expect(screen.getByLabelText('BotID')).toHaveValue('wecom-bot'),
+    { timeout: 5000 },
+  );
+  expect(await screen.findByText('连接状态：连接中')).toBeInTheDocument();
+  await userEvent.clear(screen.getByLabelText('BotID'));
+  await userEvent.type(screen.getByLabelText('BotID'), 'draft-bot');
+
+  await waitFor(
+    () => expect(screen.getByText('连接状态：已连接')).toBeInTheDocument(),
+    { timeout: 8000 },
+  );
+  expect(screen.getByLabelText('BotID')).toHaveValue('draft-bot');
+});
+
 });

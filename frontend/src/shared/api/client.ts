@@ -180,7 +180,7 @@ function startRefresh(context: string, trigger: RefreshTrigger): Promise<string 
   return pending;
 }
 
-function refreshAccessToken(trigger: RefreshTrigger): Promise<string | null> {
+export function refreshAccessToken(trigger: RefreshTrigger): Promise<string | null> {
   synchronizePersistedAuth();
   const state = useAuthStore.getState();
   const context = JSON.stringify([state.refreshToken, state.currentWorkspace?.id]);
@@ -252,7 +252,7 @@ function refreshTriggerFor(config: InternalAxiosRequestConfig): RefreshTrigger {
   return isUserActive() ? 'user' : 'background';
 }
 
-function redirectToLogin(): void {
+export function redirectToLogin(): void {
   if (loginRedirectIssued) return;
   loginRedirectIssued = true;
   if (typeof window !== 'undefined') {

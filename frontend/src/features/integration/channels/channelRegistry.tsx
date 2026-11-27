@@ -2,6 +2,7 @@ import { i18n } from '@/shared/i18n';
 import type { ComponentType } from 'react';
 import { FeishuBindingPanel } from './feishu/FeishuBindingPanel';
 import { DingTalkBindingPanel } from './dingtalk/DingTalkBindingPanel';
+import { WecomBindingPanel } from './wecom/WecomBindingPanel';
 
 export interface ChannelPanelProps {
   /** Platform group-chat bot is enabled with complete credentials, so shared bindings can be created. */
@@ -28,6 +29,12 @@ export const CHANNEL_REGISTRY: ChannelDescriptor[] = [
     get label() { return i18n.t('integration:feishu'); },
     enabled: true,
     Panel: FeishuBindingPanel,
+  },
+  {
+    key: 'WECOM',
+    get label() { return i18n.t('integration:wecom'); },
+    enabled: true,
+    Panel: WecomBindingPanel,
   },
   {
     key: 'SLACK',

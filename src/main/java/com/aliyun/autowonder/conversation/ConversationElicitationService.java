@@ -8,6 +8,7 @@ import com.aliyun.autowonder.common.error.ErrorCode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -59,9 +60,22 @@ public class ConversationElicitationService {
     /** 用 setter 注入：ConversationTurnEventService 也持有本服务，构造器注入会成环。 */
     private ConversationBrowserEventPublisher browserEventPublisher;
     private ConversationAnswerDeliveryService answerDeliveryService;
+    private ClarificationAnswerActorPolicy answerActorPolicy;
+    private ApplicationEventPublisher events;
+    private ConversationQuestionToolService questionTool;
     private long expiryCursor;
     @Autowired(required = false)
     public void setAnswerDeliveryService(ConversationAnswerDeliveryService service) { this.answerDeliveryService=service; }
+
+    @Autowired(required = false)
+    public void setQuestionTool(ConversationQuestionToolService questionTool) {
+        this.questionTool = questionTool;
+    }
+
+    @Autowired(required = false)
+    public void setAnswerActorPolicy(ClarificationAnswerActorPolicy answerActorPolicy) {
+        this.answerActorPolicy = answerActorPolicy;
+    }
 
     public ConversationElicitationService(AgentConversationElicitationDao elicitationDao,
             AgentConversationDao convDao, ConversationTransport transport,
@@ -77,6 +91,11 @@ public class ConversationElicitationService {
     public void setBrowserEventPublisher(
             ConversationBrowserEventPublisher browserEventPublisher) {
         this.browserEventPublisher = browserEventPublisher;
+    }
+
+    @Autowired(required = false)
+    public void setApplicationEventPublisher(ApplicationEventPublisher events) {
+        this.events = events;
     }
 
     /**
@@ -133,10 +152,12 @@ public class ConversationElicitationService {
         JSONObject requestedSchema = data.getJSONObject("requestedSchema");
         record.setSchemaJson(requestedSchema == null ? null : requestedSchema.toJSONString());
         record.setStatus(STATUS_PENDING);
+        AgentConversationDO conv = convDao.findById(tenantId, conversationId);
+        Long submittedUserId = null;
         {
             AgentConversationTurnDO turn = turnDao.findByConversationTurnForUpdate(tenantId, conversationId, turnId);
+            if (turn != null) submittedUserId = turn.getSubmittedUserId();
             if (AgentConversationService.questionExpiryStop(turn) != null) record.setStatus(STATUS_CANCELED);
-            AgentConversationDO conv = convDao.findById(tenantId, conversationId);
             if (turn != null && turn.getDispatchAttempt() != null && turn.getDispatchAttempt() > 0
                     && conv != null && conv.getExecutorId() != null) {
                 if (data.getIntValue("answerProtocolVersion") == 1) record.setAnswerProtocolVersion(1);
@@ -146,6 +167,14 @@ public class ConversationElicitationService {
         }
         // 幂等靠 uk_conv_request 的 INSERT IGNORE，不在热路径上多一次查询。
         int inserted = elicitationDao.insertIfAbsent(record);
+        if (inserted == 1 && STATUS_PENDING.equals(record.getStatus())
+                && conv != null && events != null
+                && WorkitemClarificationConversationService.CHANNEL.equals(conv.getChannel())
+                && WorkitemClarificationConversationService.BIZ_REF_TYPE.equals(conv.getBizRefType())
+                && conv.getBizRefId() != null) {
+            events.publishEvent(new WorkitemClarificationQuestionOpened(tenantId, conv.getBizRefId(),
+                    conversationId, conv.getAgentId(), turnId, submittedUserId, requestId, record.getMessage()));
+        }
         if (STATUS_CANCELED.equals(record.getStatus())) {
             boolean settled = inserted == 1 || elicitationDao.settleIfPending(tenantId, conversationId,
                     requestId, STATUS_CANCELED, null) == 1;
@@ -192,9 +221,15 @@ public class ConversationElicitationService {
         }
         AgentConversationTurnDO origin = turnDao.findByConversationTurn(tenantId, conversationId, record.getTurnId());
         if (origin != null && origin.getSubmittedUserId() != null
-                && !origin.getSubmittedUserId().equals(respondingUserId)) {
+                && !origin.getSubmittedUserId().equals(respondingUserId)
+                && (answerActorPolicy == null
+                        || !answerActorPolicy.mayAnswer(tenantId, conversationId, respondingUserId))) {
             throw BizException.keyed(ErrorCode.NO_PERMISSION, "conversation.actor_reply_forbidden", null,
-                    "only the original message sender may answer this question");
+                    "only the original message sender or the current work item owner may answer this question");
+        }
+        if (questionTool != null && ConversationQuestionToolService.isToolRequest(requestId)) {
+            replyQuestionTool(tenantId, conversationId, record, action, answerJson);
+            return;
         }
         if (Integer.valueOf(1).equals(record.getAnswerProtocolVersion()) && answerDeliveryService != null) {
             String normalized = normalizeReply(record.getSchemaJson(), action, answerJson);
@@ -235,6 +270,33 @@ public class ConversationElicitationService {
             throw e;
         }
         log.info("acp elicitation replied conversationId={} turnId={} requestId={} action={}",
+                conversationId, record.getTurnId(), requestId, action);
+    }
+
+    /**
+     * 平台提问工具创建的卡片没有执行器侧挂起请求：抢到终态后只唤醒平台上的
+     * 工具调用者，不发执行器帧。
+     */
+    private void replyQuestionTool(long tenantId, long conversationId,
+            AgentConversationElicitationDO record, String action, String answerJson) {
+        String requestId = record.getRequestId();
+        if (!STATUS_PENDING.equals(record.getStatus())) {
+            throw BizException.keyed(ErrorCode.CONFLICT, "conversation.elicitation_settled",
+                    new Object[]{record.getStatus()}, "elicitation already settled: " + record.getStatus());
+        }
+        String normalizedAnswer = normalizeReply(record.getSchemaJson(), action, answerJson);
+        String status = ACTION_ACCEPT.equals(action) ? STATUS_ANSWERED : STATUS_DECLINED;
+        int settled = legacyAnswerTransaction(() -> {
+            requireProcessingTurn(tenantId, conversationId, record.getTurnId());
+            return elicitationDao.settleIfPending(tenantId, conversationId, requestId, status, normalizedAnswer);
+        });
+        if (settled != 1) {
+            throw BizException.keyed(ErrorCode.CONFLICT, "conversation.elicitation_concurrent",
+                    new Object[]{requestId}, "elicitation was settled concurrently: " + requestId);
+        }
+        questionTool.publishAnswer(tenantId, conversationId, record.getTurnId(), requestId, status,
+                normalizedAnswer);
+        log.info("question tool replied conversationId={} turnId={} requestId={} action={}",
                 conversationId, record.getTurnId(), requestId, action);
     }
 
@@ -323,12 +385,29 @@ public class ConversationElicitationService {
      */
     public List<AgentConversationElicitationDO> settlePendingForTurn(long tenantId,
             long conversationId, long turnId) {
+        return settlePendingForTurn(tenantId, conversationId, turnId, STATUS_CANCELED);
+    }
+
+    /**
+     * 轮次已终结但卡片仍要保留：把该轮挂起卡置 EXPIRED，前端按超时卡片继续提供文本作答。
+     *
+     * <p>与 {@link #settlePendingForTurn} 一样只写库、不发副作用，调用方须在提交之后
+     * 用 {@link #notifySystemStopped(List)} 唤醒工具等待线程并通知浏览器。
+     */
+    public List<AgentConversationElicitationDO> expirePendingForTurn(long tenantId,
+            long conversationId, long turnId) {
+        return settlePendingForTurn(tenantId, conversationId, turnId, STATUS_EXPIRED);
+    }
+
+    private List<AgentConversationElicitationDO> settlePendingForTurn(long tenantId,
+            long conversationId, long turnId, String status) {
         turnDao.findByConversationTurnForUpdate(tenantId, conversationId, turnId);
         elicitationDao.closeAnswerDeliveriesForTurn(tenantId, conversationId, turnId);
         List<AgentConversationElicitationDO> settled = new ArrayList<>();
         for (AgentConversationElicitationDO record : elicitationDao.listPendingByTurn(tenantId, turnId)) {
             if (elicitationDao.settleIfPending(record.getTenantId(), record.getConversationId(),
-                    record.getRequestId(), STATUS_CANCELED, null) == 1) {
+                    record.getRequestId(), status, null) == 1) {
+                record.setStatus(status);
                 settled.add(record);
             }
             // 抢不到说明用户刚好同时作答，答案已下发，不能再发一个矛盾的动作。
@@ -339,9 +418,24 @@ public class ConversationElicitationService {
     /** 发出 {@link #settlePendingForTurn} 攒下的副作用。必须在事务提交之后调用。 */
     public void notifyCanceled(List<AgentConversationElicitationDO> settled) {
         for (AgentConversationElicitationDO record : settled) {
-            notifyRuntimeBestEffort(record, ACTION_CANCEL, STATUS_CANCELED);
+            if (!wakeQuestionTool(record, STATUS_CANCELED)) {
+                notifyRuntimeBestEffort(record, ACTION_CANCEL, STATUS_CANCELED);
+            }
             notifyBrowserBestEffort(record, ACTION_CANCEL, STATUS_CANCELED);
         }
+    }
+
+    /**
+     * 工具创建的卡片没有执行器侧挂起请求：唤醒平台上的工具调用即可，返回 true
+     * 表示已接管，调用方不要再发执行器帧。
+     */
+    private boolean wakeQuestionTool(AgentConversationElicitationDO record, String status) {
+        if (questionTool == null || !ConversationQuestionToolService.isToolRequest(record.getRequestId())) {
+            return false;
+        }
+        questionTool.wake(record.getConversationId(), record.getRequestId(), status,
+                record.getAnswerJson());
+        return true;
     }
 
     /** System expiry stops the execution; it never fabricates an ACP answer. */
@@ -383,7 +477,7 @@ public class ConversationElicitationService {
         List<AgentConversationElicitationDO> settled = new ArrayList<>();
         settled.add(row);
         // Preserve real answers and truthful uncertainty. This path sends no question replies.
-        settled.addAll(settlePendingForTurn(row.getTenantId(), row.getConversationId(), row.getTurnId()));
+        settled.addAll(expirePendingForTurn(row.getTenantId(), row.getConversationId(), row.getTurnId()));
         return settled;
     }
 
@@ -399,6 +493,8 @@ public class ConversationElicitationService {
 
     void notifySystemStopped(List<AgentConversationElicitationDO> settled) {
         for (var row : settled) {
+            wakeQuestionTool(row,
+                    STATUS_EXPIRED.equals(row.getStatus()) ? STATUS_EXPIRED : STATUS_CANCELED);
             notifyBrowserBestEffort(row, ACTION_CANCEL,
                     STATUS_EXPIRED.equals(row.getStatus()) ? STATUS_EXPIRED : STATUS_CANCELED, true);
         }
@@ -512,4 +608,8 @@ public class ConversationElicitationService {
         }
         return message.substring(0, MAX_MESSAGE_LENGTH);
     }
+
+    /** 工单需求澄清对话中出现待人工回答的问题，通知监听器据此推送待决策提醒。 */
+    public record WorkitemClarificationQuestionOpened(long tenantId, long workitemId, long conversationId,
+            Long agentId, long turnId, Long submittedUserId, String requestId, String message) {}
 }

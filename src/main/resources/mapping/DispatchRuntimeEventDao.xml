@@ -130,6 +130,19 @@
         ORDER BY id ASC
     </select>
 
+    <select id="listByDispatchForTrace" resultMap="runtimeEventMap">
+        SELECT <include refid="cols"/> FROM dispatch_runtime_event
+        WHERE tenant_id = #{tenantId} AND dispatch_id = #{dispatchId}
+          AND event_type &lt;&gt; 'agent.message'
+        ORDER BY id ASC
+    </select>
+
+    <select id="findLatestIdForTrace" resultType="java.lang.Long">
+        SELECT MAX(id) FROM dispatch_runtime_event
+        WHERE tenant_id = #{tenantId} AND dispatch_id = #{dispatchId}
+          AND event_type &lt;&gt; 'agent.message'
+    </select>
+
     <select id="listByDispatchAfterId" resultMap="runtimeEventMap">
         SELECT <include refid="cols"/> FROM dispatch_runtime_event
         WHERE tenant_id = #{tenantId} AND dispatch_id = #{dispatchId}

@@ -7,7 +7,7 @@ import { useTranslation } from 'react-i18next';
 import { RecoveryControls } from './components/RecoveryControls';
 import { DispatchRequests } from './components/DispatchRequests';
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-import { Empty, Input, Modal, Spin, Result, Button } from 'antd';
+import { Empty, Input, Modal, Spin, Result, Button, Tabs } from 'antd';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { useTemplateDetail } from '@/features/statemachine/hooks';
@@ -50,12 +50,15 @@ import { useAuthStore } from '@/shared/auth/store';
 import { CLARIFICATION_THEME } from './clarification/theme';
 import { TRANSITION_REASON_MAX_LENGTH } from './transitionLimits';
 import type { Artifact, CommentInteraction, Participant } from '@/shared/types/workitem';
+import { useIsMobile } from '@/shared/ui/useIsMobile';
 
 const CLARIFY_MIN_WIDTH = 320;
 
 // 模块级空数组：查询数据未就绪时不生成新引用，避免时间线 memo 被空数组默认值击穿。
 const EMPTY_PARTICIPANTS: Participant[] = [];
 const EMPTY_ARTIFACTS: Artifact[] = [];
+const MOBILE_VIEW_COMMENTS = 'comments';
+const MOBILE_VIEW_PROGRESS = 'progress';
 
 export function WorkitemDetailPage() {
   const { t } = useTranslation('workitem');
@@ -87,6 +90,10 @@ export function WorkitemDetailPage() {
   const leftScrollRef = useRef<HTMLDivElement>(null);
   const commentRef = useRef<HTMLDivElement>(null);
   const [searchParams, setSearchParams] = useSearchParams();
+  const isMobile = useIsMobile();
+  const [mobileView, setMobileView] = useState<'comments' | 'progress'>(
+    () => readClarifyView(searchParams).mode === 'clarify' ? 'progress' : 'comments',
+  );
   // Router 导航可以延后提交。同帧的全屏/会话上报必须累积到尚未提交的 URL，
   // 否则后一次上报会用旧 searchParams 覆盖前一次变更。
   const clarifySearchRef = useRef({ committed: searchParams, pending: searchParams });
@@ -96,6 +103,14 @@ export function WorkitemDetailPage() {
   // 澄清视图状态挂在 URL 上：刷新后仍停在原工单的原澄清会话并恢复全屏态（工单 53035）
   const clarifyView = readClarifyView(searchParams);
   const panelMode = clarifyView.mode;
+  useEffect(() => {
+    if (isMobile && panelMode === 'clarify') setMobileView('progress');
+  }, [isMobile, panelMode]);
+  const handleMobileViewChange = (next: 'comments' | 'progress') => {
+    setMobileView(next);
+    // 切回评论页签时退出澄清态，否则 URL 里的 clarify 会立刻把页签拽回进度。
+    if (next === 'comments' && panelMode === 'clarify') updateClarifyView({ mode: 'progress' });
+  };
   const [clarifyWidth, setClarifyWidth] = useState<number | null>(null);
   const rightPanelRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -180,7 +195,9 @@ export function WorkitemDetailPage() {
 
   if (!id) return <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', textAlign: 'center' }}><Result status="404" title={t('detail.invalidId')} extra={<Button onClick={() => navigate(-1)}>{t('detail.back')}</Button>} /></div>;
   if (isLoading) return <Spin size="large" style={{ display: 'block', margin: '100px auto' }} />;
-  if (isError) return (
+  // 轮询后台刷新失败时 react-query 会保留已加载数据（isError=true 但 data 还在）。
+  // 只有一次都没加载成功才整页替换成错误页，否则页面会从有数据被抹成 502（需求：502 保留数据）。
+  if (isError && !workitem) return (
     <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', textAlign: 'center' }}>
       {owningWorkspace ? (
         <OtherWorkspacePrompt owning={owningWorkspace} />
@@ -281,9 +298,21 @@ export function WorkitemDetailPage() {
   };
 
   return (
-    <div className="aw-detail-page" style={{ height: '100%' }}>
-      {/* Left Panel：原型 05c 主栏为画布上的并列白卡（头部 / 需求与设计 / 评论&时间线） */}
-      <section className="aw-detail-main aw-wi-main">
+    <div className="aw-detail-page" style={{ height: '100%', flexDirection: isMobile ? 'column' : undefined }}>
+      {isMobile && (
+        <Tabs
+          data-testid="workitem-mobile-tabs"
+          activeKey={mobileView}
+          onChange={(key) => handleMobileViewChange(key as 'comments' | 'progress')}
+          items={[
+            { key: MOBILE_VIEW_COMMENTS, label: t('detail.commentsTab') },
+            { key: MOBILE_VIEW_PROGRESS, label: t('detail.progressTab') },
+          ]}
+          style={{ flexShrink: 0, padding: '0 12px', marginBottom: 0 }}
+        />
+      )}
+      {/* Left Panel：原型 05c 主栏为画布上的并列白卡（头部 / 需求与设计 / 评论&时间线）；移动端按页签条件渲染 */}
+      {(!isMobile || mobileView === MOBILE_VIEW_COMMENTS) && <section className="aw-detail-main aw-wi-main">
         <div
           data-testid="workitem-scroll-region"
           style={{ position: 'relative', flex: 1, minHeight: 0, overflow: 'visible', display: 'flex' }}
@@ -397,16 +426,19 @@ export function WorkitemDetailPage() {
           </div>
           <ScrollToEdgeButton containerRef={leftScrollRef} />
         </div>
-      </section>
+      </section>}
 
-      {/* Right Panel：原型 05 右栏 380 轨道，透明底直接挂画布；澄清模式接管时恢复面板底色 */}
-      <div
+      {/* Right Panel：原型 05 右栏 380 轨道，透明底直接挂画布；澄清模式接管时恢复面板底色；移动端按页签条件渲染 */}
+      {(!isMobile || mobileView === MOBILE_VIEW_PROGRESS) && <div
         ref={rightPanelRef}
         data-testid="workitem-right-panel"
         className="aw-detail-aside"
         style={{
-          width: clarifyWidth != null ? `${clarifyWidth}px` : '380px',
+          width: isMobile ? '100%' : clarifyWidth != null ? `${clarifyWidth}px` : '380px',
+          flex: isMobile ? 1 : undefined,
           flexShrink: 0,
+          minHeight: isMobile ? 0 : undefined,
+          padding: isMobile ? 10 : undefined,
           overflowY: 'auto',
           position: 'relative',
           display: panelMode === 'clarify' ? 'flex' : 'block',
@@ -429,6 +461,7 @@ export function WorkitemDetailPage() {
         <RightPanel
           key={id}
           workitemId={id}
+          workitemTitle={workitem.title}
           timeline={timeline}
           participants={participants}
           participantsLoading={participantsLoading}
@@ -453,7 +486,7 @@ export function WorkitemDetailPage() {
           onFullscreenChange={(fullscreen) => updateClarifyView({ fullscreen })}
           onClarifyContextChange={handleClarifyContextChange}
         />
-      </div>
+      </div>}
 
       <ClarifyReminderModal
         open={clarifyReminderOpen}
@@ -465,6 +498,8 @@ export function WorkitemDetailPage() {
         open={deliveryOpen}
         workitemId={id}
         hasSdlc={hasSdlc}
+        currentAgentId={workitem.assigneeType === 'AGENT' ? workitem.assigneeRef : null}
+        currentSdlcId={workitem.sdlcId}
         onClose={() => setDeliveryOpen(false)}
       />
       <AssignHumanModal

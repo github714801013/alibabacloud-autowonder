@@ -8,7 +8,9 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter, useNavigate } from 'react-router-dom';
 import { useAuthStore } from '@/shared/auth/store';
 import { i18n } from '@/shared/i18n';
+import { ApiError, ErrorCodes } from '@/shared/types/common';
 import { ChiefOfStaff, wideResizeExit } from './ChiefOfStaff';
+import { selectText, stubRangeRect } from '@/test/selection';
 import * as api from './api';
 import { buildExecutorLaunchCommand, type ExecutorLaunchCommandVO } from '@/features/executor/api';
 import {
@@ -133,6 +135,47 @@ describe('Chief of Staff', () => {
     expect(screen.getByRole('button', { name: '初始化工作空间' })).toBeDisabled();
     expect(api.sendMessage).not.toHaveBeenCalled();
     expect(screen.getByRole('textbox', { name: '输入消息' })).toHaveValue('my draft');
+  });
+
+  it('sends the selected assistant reply as a markdown quote and clears it', async () => {
+    vi.mocked(api.getConversation).mockResolvedValue({
+      ...conversation,
+      turns: [{ id: 301, direction: 'OUT', content: '这是数字人的历史回复', status: 'COMPLETED', error: null, gmtCreate: '' }],
+    });
+    localStorage.setItem('chief-of-staff:7:1', JSON.stringify({ conversationId: 100 }));
+    stubRangeRect();
+    const user = userEvent.setup(); mount();
+    await user.click(screen.getByRole('button', { name: '打开 Chief of Staff' }));
+    const reply = await screen.findByText('这是数字人的历史回复');
+
+    selectText(reply);
+    await user.click(screen.getByRole('button', { name: '引用此内容' }));
+    await user.type(screen.getByRole('textbox', { name: '输入消息' }), '继续说明');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+
+    await waitFor(() => expect(api.sendMessage).toHaveBeenCalledWith(
+      100, '> 这是数字人的历史回复\n\n继续说明', expect.any(String), '/workitems/128'));
+    await waitFor(() => expect(screen.queryByText('引用内容')).not.toBeInTheDocument());
+    expect(screen.getByRole('textbox', { name: '输入消息' })).toHaveValue('');
+  });
+
+  it('sends the quote alone when the draft is empty', async () => {
+    vi.mocked(api.getConversation).mockResolvedValue({
+      ...conversation,
+      turns: [{ id: 301, direction: 'OUT', content: '这是数字人的历史回复', status: 'COMPLETED', error: null, gmtCreate: '' }],
+    });
+    localStorage.setItem('chief-of-staff:7:1', JSON.stringify({ conversationId: 100 }));
+    stubRangeRect();
+    const user = userEvent.setup(); mount();
+    await user.click(screen.getByRole('button', { name: '打开 Chief of Staff' }));
+    const reply = await screen.findByText('这是数字人的历史回复');
+
+    selectText(reply);
+    await user.click(screen.getByRole('button', { name: '引用此内容' }));
+    await user.click(screen.getByRole('button', { name: '发送' }));
+
+    await waitFor(() => expect(api.sendMessage).toHaveBeenCalledWith(
+      100, '> 这是数字人的历史回复', expect.any(String), '/workitems/128'));
   });
 
   it('retains a failed scenario as a draft and retries with the same message id', async () => {
@@ -887,10 +930,10 @@ it('renders seven and two answers under their IN turns after reload and never re
   for (const card of cards) expect(await screen.findAllByText(JSON.parse(card.answerJson).value)).toHaveLength(1);
 });
 
-it('restores expired original context without sending and respects Chief edit permissions and processing', async () => {
+it('opens an expired history question at the composer, sends selections as text and respects edit permissions', async () => {
   localStorage.setItem('chief-of-staff:7:1', JSON.stringify({ conversationId: 100 }));
   const expired = { requestId: 'expired', turnId: 200, mode: 'form', message: 'Expired question', requestedSchema: '{"type":"object","properties":{"value":{"type":"string","title":"Question detail"}}}', status: 'EXPIRED', gmtCreate: '' };
-  const data = { ...conversation, questionHistory: [expired], pendingElicitations: [{ ...expired, status: 'PENDING' }],
+  const data = { ...conversation, questionHistory: [expired],
     turns: [{ id: 200, direction: 'IN', content: 'Actual original request', status: 'CANCELED', error: null, gmtCreate: '' },
       { id: 201, direction: 'OUT', content: 'persisted fallback', status: 'CANCELED', error: null, gmtCreate: '', display: { content: { code: 'QUESTION_EXPIRED' as const, args: {} } } }] };
   vi.mocked(api.getConversation).mockResolvedValue(data);
@@ -902,23 +945,148 @@ it('restores expired original context without sending and respects Chief edit pe
   expect(screen.queryByTestId('elicitation-wizard-expired')).not.toBeInTheDocument();
   expect(screen.queryByText('persisted fallback')).not.toBeInTheDocument();
   await user.type(input, 'Keep this draft');
-  await user.click(restore); await user.click(restore);
-  expect((input as HTMLTextAreaElement).value).toContain('Keep this draft\n\n');
-  expect((input as HTMLTextAreaElement).value).toContain('Actual original request');
-  expect((input as HTMLTextAreaElement).value).toContain('Question detail');
-  expect((input as HTMLTextAreaElement).value.match(/Actual original request/g)).toHaveLength(1);
-  expect(api.sendMessage).not.toHaveBeenCalled(); expect(api.replyElicitation).not.toHaveBeenCalled();
+
+  // 打开编辑器不发送任何东西；编辑器出现在输入框上方，草稿原样保留。
+  await user.click(restore);
+  expect(screen.getByTestId('elicitation-wizard-expired')).toBeInTheDocument();
+  expect(input).toHaveValue('Keep this draft');
+  expect(api.sendMessage).not.toHaveBeenCalled();
+  expect(api.replyElicitation).not.toHaveBeenCalled();
+
+  await user.type(screen.getByTestId('elicitation-field-value'), '补充答案');
+  await user.click(screen.getByTestId('elicitation-submit-expired'));
+  await waitFor(() => expect(api.sendMessage).toHaveBeenCalledWith(
+    100, 'Q1 Question detail：补充答案', expect.any(String), null));
+  expect(api.replyElicitation).not.toHaveBeenCalled();
+  await waitFor(() => expect(screen.queryByTestId('elicitation-wizard-expired')).not.toBeInTheDocument());
+  expect(await screen.findByRole('textbox', { name: '输入消息' })).toHaveValue('Keep this draft');
+
   act(() => useAuthStore.getState().setCurrentWorkspace({ id: 1, name: 'Project', description: '' }, 'READ_ONLY'));
-  expect(restore).toBeDisabled();
+  expect(screen.getByRole('button', { name: '继续回答' })).toBeDisabled();
   act(() => useAuthStore.getState().setCurrentWorkspace({ id: 1, name: 'Project', description: '' }, 'ADMIN'));
   const query = clients[0].getQueryCache().findAll().find(q => q.state.data === data)!;
   act(() => clients[0].setQueryData(query.queryKey, { ...data, processingStatus: 'PROCESSING', processingTurnId: 202 }));
-  await waitFor(() => expect(restore).toBeDisabled());
+  await waitFor(() => expect(screen.getByRole('button', { name: '继续回答' })).toBeDisabled());
   act(() => clients[0].setQueryData(query.queryKey, data));
-  await waitFor(() => expect(restore).toBeEnabled());
-  await user.click(screen.getByRole('button', { name: '发送' }));
-  await waitFor(() => expect(api.sendMessage).toHaveBeenCalledOnce());
+  await waitFor(() => expect(screen.getByRole('button', { name: '继续回答' })).toBeEnabled());
+});
+
+it('keeps a timed-out live question editable and sends selections as a plain message', async () => {
+  localStorage.setItem('chief-of-staff:7:1', JSON.stringify({ conversationId: 100 }));
+  const pending = { requestId: 'live-expired', turnId: 200, mode: 'form', message: 'Live question',
+    requestedSchema: '{"type":"object","properties":{"value":{"type":"string","title":"Answer","oneOf":[{"const":"A","title":"Option A"}]}}}',
+    status: 'PENDING', gmtCreate: '' };
+  vi.mocked(api.getConversation).mockResolvedValue({ ...conversation, acpInteractionSupported: true,
+    processingStatus: 'PROCESSING', processingTurnId: 200, pendingElicitations: [pending],
+    turns: [{ id: 200, direction: 'IN', content: 'Live IN', status: 'PROCESSING', error: null, gmtCreate: '' }] });
+  const row = (id: number, eventType: string, data: Record<string, unknown>) => ({ eventId: id, eventType,
+    dispatchAttempt: 1, eventSeq: id, occurredAt: '2026-01-01T00:00:00Z', state: 'READY', truncated: false,
+    detailAvailable: false, summary: '', contentLength: 1, totalSegments: 1, payload: JSON.stringify({ data }) });
+  server.use(http.get('/api/platform/conversations/100/turns/200/event-summaries', () => HttpResponse.json({
+    success: true, code: '0', data: summaryPage([
+      row(1, 'acp_elicitation', { requestId: pending.requestId, message: pending.message }),
+      row(2, 'acp_elicitation_resolved', { requestId: pending.requestId, action: 'cancel', status: 'EXPIRED' }),
+    ]),
+  })));
+
+  const user = userEvent.setup(); mount();
+  await user.click(screen.getByRole('button', { name: '打开 Chief of Staff' }));
+  const wizard = await screen.findByTestId('elicitation-wizard-live-expired');
+  // 历史卡片仍标注已超时；保留的实时卡片本身不带该标记。
+  await screen.findByText('因长时间未回答而结束');
+  expect(wizard).not.toHaveTextContent('因长时间未回答而结束');
+
+  await user.click(screen.getByTestId('elicitation-option-value-0'));
+  await user.click(screen.getByTestId('elicitation-submit-live-expired'));
+  await waitFor(() => expect(api.sendMessage).toHaveBeenCalledWith(
+    100, 'Q1 Answer：Option A', expect.any(String), null));
   expect(api.replyElicitation).not.toHaveBeenCalled();
+  await waitFor(() => expect(screen.queryByTestId('elicitation-wizard-live-expired')).not.toBeInTheDocument());
+});
+
+it('does not let a read-only member submit a timed-out live question', async () => {
+  localStorage.setItem('chief-of-staff:7:1', JSON.stringify({ conversationId: 100 }));
+  act(() => useAuthStore.getState().setCurrentWorkspace({ id: 1, name: 'Project', description: '' }, 'READ_ONLY'));
+  const pending = { requestId: 'live-readonly', turnId: 200, mode: 'form', message: 'Read only question',
+    requestedSchema: '{"type":"object","properties":{"value":{"type":"string","title":"Answer","oneOf":[{"const":"A","title":"Option A"}]}}}',
+    status: 'PENDING', gmtCreate: '' };
+  vi.mocked(api.getConversation).mockResolvedValue({ ...conversation, acpInteractionSupported: true,
+    processingStatus: 'PROCESSING', processingTurnId: 200, pendingElicitations: [pending],
+    turns: [{ id: 200, direction: 'IN', content: 'Live IN', status: 'PROCESSING', error: null, gmtCreate: '' }] });
+  const row = (id: number, eventType: string, data: Record<string, unknown>) => ({ eventId: id, eventType,
+    dispatchAttempt: 1, eventSeq: id, occurredAt: '2026-01-01T00:00:00Z', state: 'READY', truncated: false,
+    detailAvailable: false, summary: '', contentLength: 1, totalSegments: 1, payload: JSON.stringify({ data }) });
+  server.use(http.get('/api/platform/conversations/100/turns/200/event-summaries', () => HttpResponse.json({
+    success: true, code: '0', data: summaryPage([
+      row(1, 'acp_elicitation', { requestId: pending.requestId, message: pending.message }),
+      row(2, 'acp_elicitation_resolved', { requestId: pending.requestId, action: 'cancel', status: 'EXPIRED' }),
+    ]),
+  })));
+
+  const user = userEvent.setup(); mount();
+  await user.click(screen.getByRole('button', { name: '打开 Chief of Staff' }));
+  await screen.findByTestId('elicitation-wizard-live-readonly');
+  await screen.findByText('因长时间未回答而结束');
+
+  await user.click(screen.getByTestId('elicitation-option-value-0'));
+  expect(screen.getByTestId('elicitation-submit-live-readonly')).toBeDisabled();
+  expect(screen.getByTestId('elicitation-readonly-live-readonly'))
+    .toHaveTextContent('有工作空间写权限的成员可以回答。');
+  await user.click(screen.getByTestId('elicitation-submit-live-readonly'));
+  expect(api.sendMessage).not.toHaveBeenCalled();
+  expect(api.replyElicitation).not.toHaveBeenCalled();
+  expect(screen.getByTestId('elicitation-wizard-live-readonly')).toBeInTheDocument();
+});
+
+it('closes a timed-out live question without sending when skipped', async () => {
+  localStorage.setItem('chief-of-staff:7:1', JSON.stringify({ conversationId: 100 }));
+  const pending = { requestId: 'skip-expired', turnId: 200, mode: 'form', message: 'Skip me',
+    requestedSchema: '{"type":"object","properties":{"value":{"type":"string","title":"Answer","oneOf":[{"const":"A","title":"Option A"}]}}}',
+    status: 'PENDING', gmtCreate: '' };
+  vi.mocked(api.getConversation).mockResolvedValue({ ...conversation, acpInteractionSupported: true,
+    processingStatus: 'PROCESSING', processingTurnId: 200, pendingElicitations: [pending],
+    turns: [{ id: 200, direction: 'IN', content: 'Live IN', status: 'PROCESSING', error: null, gmtCreate: '' }] });
+  const row = (id: number, eventType: string, data: Record<string, unknown>) => ({ eventId: id, eventType,
+    dispatchAttempt: 1, eventSeq: id, occurredAt: '2026-01-01T00:00:00Z', state: 'READY', truncated: false,
+    detailAvailable: false, summary: '', contentLength: 1, totalSegments: 1, payload: JSON.stringify({ data }) });
+  server.use(http.get('/api/platform/conversations/100/turns/200/event-summaries', () => HttpResponse.json({
+    success: true, code: '0', data: summaryPage([
+      row(1, 'acp_elicitation', { requestId: pending.requestId, message: pending.message }),
+      row(2, 'acp_elicitation_resolved', { requestId: pending.requestId, action: 'cancel', status: 'EXPIRED' }),
+    ]),
+  })));
+
+  const user = userEvent.setup(); mount();
+  await user.click(screen.getByRole('button', { name: '打开 Chief of Staff' }));
+  await screen.findByTestId('elicitation-wizard-skip-expired');
+  await screen.findByText('因长时间未回答而结束');
+
+  await user.click(screen.getByTestId('elicitation-skip-skip-expired'));
+  await waitFor(() => expect(screen.queryByTestId('elicitation-wizard-skip-expired')).not.toBeInTheDocument());
+  expect(api.sendMessage).not.toHaveBeenCalled();
+  expect(api.replyElicitation).not.toHaveBeenCalled();
+});
+
+it('falls back to a plain text message when a structured reply is rejected as no longer processing', async () => {
+  localStorage.setItem('chief-of-staff:7:1', JSON.stringify({ conversationId: 100 }));
+  const pending = { requestId: 'stale-reply', turnId: 200, mode: 'form', message: 'Stale question',
+    requestedSchema: '{"type":"object","properties":{"value":{"type":"string","title":"Answer","oneOf":[{"const":"A","title":"Option A"}]}}}',
+    status: 'PENDING', gmtCreate: '' };
+  vi.mocked(api.getConversation).mockResolvedValue({ ...conversation, acpInteractionSupported: true, pendingElicitations: [pending],
+    turns: [{ id: 200, direction: 'IN', content: 'Take a decision', status: 'SUCCESS', error: null, gmtCreate: '' }] });
+  vi.mocked(api.replyElicitation).mockRejectedValue(new ApiError(
+    ErrorCodes.CONFLICT, 'elicitation turn is no longer processing', null));
+
+  const user = userEvent.setup(); mount();
+  await user.click(screen.getByRole('button', { name: '打开 Chief of Staff' }));
+  await screen.findByTestId('elicitation-wizard-stale-reply');
+  await user.click(screen.getByTestId('elicitation-option-value-0'));
+  await user.click(screen.getByTestId('elicitation-submit-stale-reply'));
+
+  await waitFor(() => expect(api.sendMessage).toHaveBeenCalledWith(
+    100, 'Q1 Answer：Option A', expect.any(String), null));
+  expect(api.replyElicitation).toHaveBeenCalledOnce();
+  await waitFor(() => expect(screen.queryByTestId('elicitation-wizard-stale-reply')).not.toBeInTheDocument());
 });
 
 it('suppresses a stale Chief wizard after live-only resolution and resets identity scope on conversation switch', async () => {

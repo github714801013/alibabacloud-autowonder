@@ -3,6 +3,7 @@ package com.aliyun.autowonder.im.notification;
 import com.aliyun.autowonder.common.error.AlreadyLoggedException;
 import com.aliyun.autowonder.common.i18n.SystemMessages;
 import com.aliyun.autowonder.im.ImDeliveryException;
+import com.aliyun.autowonder.im.ImProvider;
 import com.aliyun.autowonder.im.ImProviderRegistry;
 import com.aliyun.autowonder.im.ImSendCommand;
 import com.aliyun.autowonder.im.PlatformImChannelConfigService;
@@ -12,6 +13,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 import org.springframework.beans.factory.DisposableBean;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
@@ -33,6 +35,7 @@ public class ImNotificationWorker implements DisposableBean {
     private final ImProviderRegistry providerRegistry;
     private final ImNotificationProperties properties;
     private final ImNotificationMessageContextResolver contextResolver;
+    private final ImTestNotificationService testNotifications;
     private final ExecutorService sendExecutor;
     private final Semaphore sendPermits;
     private final AtomicInteger consecutivePollFailures = new AtomicInteger();
@@ -46,6 +49,20 @@ public class ImNotificationWorker implements DisposableBean {
                                 ImNotificationProperties properties,
                                 ImNotificationMessageContextResolver contextResolver,
                                 ImNotificationPreferenceService preferenceService) {
+        this(queue, formatter, identityService, channelConfigService, providerRegistry, properties,
+                contextResolver, preferenceService, null);
+    }
+
+    @Autowired
+    public ImNotificationWorker(ImNotificationQueue queue,
+                                ImNotificationFormatter formatter,
+                                UserImIdentityService identityService,
+                                PlatformImChannelConfigService channelConfigService,
+                                ImProviderRegistry providerRegistry,
+                                ImNotificationProperties properties,
+                                ImNotificationMessageContextResolver contextResolver,
+                                ImNotificationPreferenceService preferenceService,
+                                ImTestNotificationService testNotifications) {
         this.queue = queue;
         this.preferenceService = preferenceService;
         this.formatter = formatter;
@@ -54,6 +71,7 @@ public class ImNotificationWorker implements DisposableBean {
         this.providerRegistry = providerRegistry;
         this.properties = properties;
         this.contextResolver = contextResolver;
+        this.testNotifications = testNotifications;
         int concurrency = properties.getSendConcurrency();
         this.sendPermits = new Semaphore(concurrency);
         this.sendExecutor = Executors.newFixedThreadPool(concurrency, r -> {
@@ -116,11 +134,24 @@ public class ImNotificationWorker implements DisposableBean {
     }
 
     void pollOnce() {
+        if (!canConsume()) {
+            return;
+        }
         processAll(queue.readNew(properties.getConsumer(), properties.getBatchSize()));
     }
 
     void recoverOnce() {
+        if (!canConsume()) {
+            return;
+        }
         processAll(queue.claimStale(properties.getConsumer(), properties.getBatchSize()));
+    }
+
+    /**
+     * 单连接渠道只有租约持有者消费通知流；非持有者不领取，避免反复领取把投递次数耗尽。
+     */
+    private boolean canConsume() {
+        return providerRegistry.require(channelConfigService.selectedProvider()).canDeliverNow();
     }
 
     void process(ImNotificationEnvelope envelope) {
@@ -204,6 +235,7 @@ public class ImNotificationWorker implements DisposableBean {
             log.error("IM notification drop after max attempts messageId={} notificationKey={} deliveryCount={}",
                     envelope.messageId(), task.notificationKey(), envelope.deliveryCount());
             retainInDlq(envelope, reason);
+            markTestTerminal(task, ImTestNotificationService.STATUS_FAILED);
             queue.ack(envelope.messageId());
             return;
         }
@@ -222,7 +254,8 @@ public class ImNotificationWorker implements DisposableBean {
         try {
             // New system notifications default to IM: the legacy personal preference and the
             // per-tenant NOTIFY switch no longer block them. Queued legacy tasks keep that path.
-            if (!task.bypassesLegacyImPreference()
+            // 测试通知用于验证渠道本身，不因用户关闭该类通知偏好而被拦截。
+            if (!task.bypassesLegacyImPreference() && !task.isImTest()
                     && preferenceService.isDisabled(task.tenantId(), task.recipientUserId(),
                     task.notificationType(), provider)) {
                 queue.ack(envelope.messageId());
@@ -231,23 +264,35 @@ public class ImNotificationWorker implements DisposableBean {
             UserImIdentityDO identity = identityService.find(task.recipientUserId(), provider);
             if (identity == null || !hasText(identity.getExternalUserId())) {
                 logTerminated(envelope, task, "identity-missing");
+                markTestTerminal(task, ImTestNotificationService.STATUS_FAILED);
                 queue.ack(envelope.messageId());
                 return;
             }
             if (!channelConfigService.isReady(provider)) {
                 logTerminated(envelope, task, "channel-not-ready");
+                markTestTerminal(task, ImTestNotificationService.STATUS_FAILED);
                 queue.ack(envelope.messageId());
                 return;
             }
+            ImProvider providerImpl = providerRegistry.require(provider);
+            if (!providerImpl.canDeliverNow()) {
+                // 单连接渠道只有持有者可发送；保留在队列中，等待持有者重领，不 ACK 也不丢消息。
+                log.info("IM notification deferred until provider can send messageId={} notificationKey={} provider={}",
+                        envelope.messageId(), task.notificationKey(), provider);
+                return;
+            }
 
-            // Snapshot tasks render without any work item or workspace lookup; dedicated-listener
-            // tasks keep their richer work-item rendering.
-            String markdown = task.hasNotificationSnapshot()
-                    ? formatter.formatSystemNotification(task)
-                    : formatter.format(contextResolver.resolve(task), task);
+            // Snapshot tasks render without any work item or workspace lookup; pre-rendered
+            // payloads already carry their own content; dedicated-listener tasks keep their
+            // richer work-item rendering.
+            String markdown = task.isPreRendered()
+                    ? formatter.format(null, task)
+                    : task.hasNotificationSnapshot()
+                            ? formatter.formatSystemNotification(task)
+                            : formatter.format(contextResolver.resolve(task), task);
 
             long providerStartMs = System.currentTimeMillis();
-            providerRegistry.require(provider).send(new ImSendCommand(
+            providerImpl.send(new ImSendCommand(
                     provider,
                     identity.getExternalUserId(),
                     messageTitle(task),
@@ -255,6 +300,7 @@ public class ImNotificationWorker implements DisposableBean {
             long providerLatencyMs = System.currentTimeMillis() - providerStartMs;
 
             queue.markDelivered(task.notificationKey());
+            markTestTerminal(task, ImTestNotificationService.STATUS_SENT);
             queue.ack(envelope.messageId());
             log.info("IM notification delivered messageId={} notificationKey={} requestId={} "
                             + "provider={} providerLatencyMs={} queueLatencyMs={}",
@@ -262,6 +308,17 @@ public class ImNotificationWorker implements DisposableBean {
                     provider, providerLatencyMs, enqueueToDequeueMs);
         } catch (ImDeliveryException e) {
             SafeImNotificationDeliveryException safe = SafeImNotificationDeliveryException.from(e);
+            if (e.isUnknown()) {
+                // 帧已写出但未收到确认：不再自动重发，写入 DLQ 并报文结果未知。
+                log.error("IM notification delivery outcome unknown messageId={} notificationKey={} "
+                                + "provider={} deliveryCount={} providerCode={} providerRequestId={}",
+                        envelope.messageId(), task.notificationKey(), provider, envelope.deliveryCount(),
+                        safeValue(e.getProviderCode()), safeValue(e.getProviderRequestId()), safe);
+                retainInDlq(envelope, "outcome unknown: providerCode=" + safeValue(e.getProviderCode()));
+                markTestTerminal(task, ImTestNotificationService.STATUS_UNKNOWN);
+                queue.ack(envelope.messageId());
+                return;
+            }
             if (e.isRetryable()) {
                 log.error("IM notification delivery retryable failure messageId={} notificationKey={} "
                                 + "provider={} deliveryCount={} deliveryRetryable={} providerCode={} "
@@ -275,12 +332,20 @@ public class ImNotificationWorker implements DisposableBean {
                             + "provider={} deliveryRetryable={} providerCode={} providerRequestId={}",
                     envelope.messageId(), task.notificationKey(), provider, e.isRetryable(),
                     safeValue(e.getProviderCode()), safeValue(e.getProviderRequestId()), safe);
+            markTestTerminal(task, ImTestNotificationService.STATUS_FAILED);
             queue.ack(envelope.messageId());
         } catch (Exception e) {
             AlreadyLoggedException safe = AlreadyLoggedException.from(e);
             log.error("IM notification processing failed messageId={} notificationKey={}",
                     envelope.messageId(), task.notificationKey(), safe);
         }
+    }
+
+    private void markTestTerminal(ImNotificationTask task, String status) {
+        if (testNotifications == null || task == null || !task.isImTest()) {
+            return;
+        }
+        testNotifications.markTerminal(task, status);
     }
 
     private void retainInDlq(ImNotificationEnvelope envelope, String reason) {
@@ -337,8 +402,10 @@ public class ImNotificationWorker implements DisposableBean {
             return task.notificationTitle();
         }
         String notificationType = task == null ? null : task.notificationType();
+        if (task != null && task.isPreRendered()) return task.workitemTitle();
         if (ImNotificationTask.TYPE_APPROVAL_REQUIRED.equals(notificationType)
-                || ImNotificationTask.TYPE_INPUT_REQUIRED.equals(notificationType)) return task.workitemTitle();
+                || ImNotificationTask.TYPE_INPUT_REQUIRED.equals(notificationType)
+                || ImNotificationTask.TYPE_CLARIFICATION_REPLY.equals(notificationType)) return task.workitemTitle();
         if (ImNotificationTask.TYPE_COMMENT_MENTION.equals(notificationType)) {
             return SystemMessages.render("im.push.comment", null, "工单评论提醒", task.deliveryLocale());
         }

@@ -12,6 +12,9 @@ export function AnswerHistory({ entries, onContinue, canContinue = false }: {
   const { t } = useTranslation('workitem');
   const history = entries.map(entry => {
     const expired = entry.status === 'EXPIRED';
+    // 超时、系统取消、用户跳过都保留历史卡，用户仍可改选后按文本发送。
+    const continuable = expired || entry.status === 'CANCELED' || entry.status === 'DECLINED'
+      || entry.action === 'cancel' || entry.action === 'decline';
     const issue = entry.deliveryStatus === 'UNKNOWN' || entry.deliveryStatus === 'UNAVAILABLE'
       ? t(`clarification.answerDelivery.${entry.deliveryStatus}`) : null;
     return <div key={`${entry.turnId}:${entry.requestId}`} data-testid={`question-history-${entry.turnId}-${entry.requestId}`}>
@@ -25,7 +28,7 @@ export function AnswerHistory({ entries, onContinue, canContinue = false }: {
         <span className="ic"><AwStrokeIcon name="alert-t" size={14} /></span>
         <span className="grow">{issue}</span>
       </div>}
-      {expired && onContinue && <div className="aw-cl-qa-foot">
+      {continuable && onContinue && <div className="aw-cl-qa-foot">
         <Button size="small" disabled={!canContinue} onClick={() => onContinue(entry)}>{t('clarification.history.continue')}</Button>
         {!canContinue && <Typography.Text type="secondary" style={{ fontSize: 12 }}>{t('clarification.history.continueUnavailable')}</Typography.Text>}
       </div>}

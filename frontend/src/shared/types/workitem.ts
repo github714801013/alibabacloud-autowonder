@@ -537,6 +537,7 @@ export interface RuntimeTrace {
   provider?: string | null;
   changed: boolean;
   lastSeq?: number | null;
+  nextBeforeId?: number | null;
   tokenUsage: RuntimeTraceTokenUsage;
   events: RuntimeTraceEvent[];
   sessions: RuntimeTraceSession[];

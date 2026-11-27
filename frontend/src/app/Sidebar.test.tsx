@@ -237,17 +237,19 @@ describe('Sidebar', () => {
 
   it('survives storage read and write failures', async () => {
     // Node 26 内置 localStorage 的 getItem/setItem 是实例自有属性，Storage.prototype 的 spy 不会生效。
-    const storage = window.localStorage;
-    const originalGet = Object.getOwnPropertyDescriptor(storage, 'getItem');
-    const originalSet = Object.getOwnPropertyDescriptor(storage, 'setItem');
+    const originalStorage = Object.getOwnPropertyDescriptor(window, 'localStorage');
     let reads = 0;
     let writes = 0;
-    Object.defineProperty(storage, 'getItem', { configurable: true, value: () => { reads += 1; throw new Error('denied'); } });
-    Object.defineProperty(storage, 'setItem', { configurable: true, value: () => { writes += 1; throw new Error('denied'); } });
-    const restore = (key: 'getItem' | 'setItem', descriptor?: PropertyDescriptor) => {
-      if (descriptor) Object.defineProperty(storage, key, descriptor);
-      else delete (storage as unknown as Record<string, unknown>)[key];
-    };
+    const storage = {
+      getItem: () => { reads += 1; throw new Error('denied'); },
+      setItem: () => { writes += 1; throw new Error('denied'); },
+      removeItem: () => {},
+      clear: () => {},
+      key: () => null,
+      length: 0,
+    } as unknown as Storage;
+    Object.defineProperty(window, 'localStorage', { configurable: true, value: storage });
+    vi.stubGlobal('localStorage', storage);
     try {
       const { container } = render(<TestWrapper initialEntry="/workitems"><Sidebar /></TestWrapper>);
       expect(screen.getByRole('link', { name: '工单' })).toHaveAttribute('aria-current', 'page');
@@ -256,8 +258,8 @@ describe('Sidebar', () => {
       expect(reads).toBeGreaterThan(0);
       expect(writes).toBeGreaterThan(0);
     } finally {
-      restore('getItem', originalGet);
-      restore('setItem', originalSet);
+      if (originalStorage) Object.defineProperty(window, 'localStorage', originalStorage);
+      vi.unstubAllGlobals();
     }
   });
 });

@@ -242,5 +242,11 @@
   "table": {
     "total_one": "{{count}} item",
     "total_other": "{{count}} items"
+  },
+  "quote": {
+    "pill": "Quote",
+    "cardLabel": "Quoted content",
+    "remove": "Remove quote",
+    "truncated": "Quoted content truncated"
   }
 }
