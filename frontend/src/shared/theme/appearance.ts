@@ -84,7 +84,7 @@ export function createAppearanceTheme(mode: ResolvedAppearance, accent: string):
       colorBorder: v['--aw-border'], colorBorderSecondary: v['--aw-border'], colorFillAlter: v['--aw-gray-bg'],
       colorError: dark ? '#ff827e' : '#e00000', colorSuccess: dark ? '#49d8a2' : '#009431',
       colorWarning: dark ? '#f5cc58' : '#967d00', colorWarningBg: dark ? '#2c2618' : '#fff9d9', colorWarningBorder: dark ? '#554628' : '#ead58a',
-      borderRadius: 6, borderRadiusLG: 8, borderRadiusSM: 4, controlHeight: 32, controlHeightSM: 26, fontSize: 13,
+      borderRadius: 6, borderRadiusLG: 8, borderRadiusSM: 4, controlHeight: 32, controlHeightSM: 26, fontSize: 14,
       fontFamily: FONT_FAMILY,
     },
     components: {

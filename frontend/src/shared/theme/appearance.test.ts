@@ -78,7 +78,7 @@ describe('appearance', () => {
   it('applies the redesign density, radii and typography tokens globally', () => {
     for (const mode of ['dark', 'light'] as const) {
       const config = createAppearanceTheme(mode, '#f97316');
-      expect(config.token?.fontSize).toBe(13);
+      expect(config.token?.fontSize).toBe(14);
       expect(config.token?.controlHeight).toBe(32);
       expect(config.token?.controlHeightSM).toBe(26);
       expect(config.token?.borderRadius).toBe(6);

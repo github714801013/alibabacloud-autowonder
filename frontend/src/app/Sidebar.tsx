@@ -27,6 +27,7 @@ export type NavLabelKey =
   | 'nav.skills'
   | 'nav.insights'
   | 'nav.settingsHub'
+  | 'nav.settings'
   | 'nav.groupDeliveryConfig'
   | 'nav.groupWorkspace'
   | 'nav.groupCompliance'
@@ -102,6 +103,7 @@ export const SETTINGS_SPACE: NavSpace = {
     { key: '/integrations', labelKey: 'nav.integrations', icon: 'api', groupLabelKey: 'nav.groupDeliveryConfig' },
     { key: '/settings/members', labelKey: 'nav.members', icon: 'team', groupLabelKey: 'nav.groupWorkspace' },
     { key: '/settings/backups', labelKey: 'nav.backups', icon: 'backup', groupLabelKey: 'nav.groupWorkspace' },
+    { key: '/settings', labelKey: 'nav.settings', icon: 'gear', groupLabelKey: 'nav.groupWorkspace' },
     { key: '/audit-logs', labelKey: 'nav.audit', icon: 'audit', groupLabelKey: 'nav.groupCompliance' },
   ],
 };

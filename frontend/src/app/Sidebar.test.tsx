@@ -32,7 +32,7 @@ const SETTINGS_PANEL_LABELS = [
   '数字员工', '小队', 'SDLC 流程', '执行器',
   '仓库', '记忆', '能力',
   '状态模版', '环境变量', '平台集成',
-  '成员管理', '项目配置备份',
+  '成员管理', '项目配置备份', '系统设置',
   '审计日志',
 ];
 
@@ -302,6 +302,7 @@ describe('Sidebar helpers', () => {
       '/integrations',
       '/settings/members',
       '/settings/backups',
+      '/settings',
       '/audit-logs',
     ]);
     expect(SETTINGS_SPACE.items.map((item) => item.groupLabelKey)).toEqual([
@@ -310,6 +311,7 @@ describe('Sidebar helpers', () => {
       'nav.groupDeliveryConfig',
       'nav.groupDeliveryConfig',
       'nav.groupDeliveryConfig',
+      'nav.groupWorkspace',
       'nav.groupWorkspace',
       'nav.groupWorkspace',
       'nav.groupCompliance',
@@ -346,8 +348,8 @@ describe('Sidebar helpers', () => {
     expect(resolveSelectedNavKey('/integrations/channels')).toBe('/integrations');
     expect(resolveSelectedNavKey('/settings/environment-variables')).toBe('/settings/environment-variables');
     expect(resolveSelectedNavKey('/status-templates')).toBe('/status-templates');
-    expect(resolveSelectedNavKey('/settings/overview')).toBe('');
-    expect(resolveSelectedNavKey('/settings/members-roles/roles')).toBe('');
+    expect(resolveSelectedNavKey('/settings/overview')).toBe('/settings');
+    expect(resolveSelectedNavKey('/settings/members-roles/roles')).toBe('/settings');
     expect(resolveSelectedNavKey('/overview')).toBe('');
   });
 

@@ -188,8 +188,8 @@ describe('AppLayout', () => {
       expect(mark).toHaveClass('aw-initial-mark');
     });
     expect(screen.getByRole('button', { name: '用户菜单' })).toHaveTextContent('爱');
-    // 配置项收进设置的轨道空间，面板列出设置页；「设置」入口保持选中。
-    expect(screen.queryByText('系统设置')).not.toBeInTheDocument();
+    // 配置项收进设置的轨道空间，面板列出设置页（含系统设置）；「设置」入口保持选中。
+    expect(screen.getByRole('link', { name: '系统设置' })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: '成员管理' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '设置' })).toHaveAttribute('aria-current', 'true');
     // 设置页由外壳自带画布，不再套全局 .aw-content-frame。
